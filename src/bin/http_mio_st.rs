@@ -9,6 +9,21 @@ enum State {
     Closing,
 }
 
+struct Listener {
+    ready: mio::Ready,
+    inner: mio::net::TcpListener,
+}
+
+impl Listener {
+    fn add_readiness(&mut self, ready: mio::Ready) {
+        self.ready |= ready;
+    }
+
+    fn is_ready(&self) -> bool {
+        self.ready.contains(mio::Ready::readable())
+    }
+}
+
 struct Connection {
     state: State,
     ready: mio::Ready,
@@ -37,13 +52,11 @@ impl Connection {
             in_pos: 0,
             in_end: 0,
 
-            out_buf: Vec::with_capacity(4096),
+            out_buf: Vec::new(),
             out_pos: 0,
         }
     }
-}
 
-impl Connection {
     fn add_readiness(&mut self, ready: mio::Ready) {
         self.ready |= ready;
     }
@@ -215,38 +228,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let poll = mio::Poll::new()?;
     let mut events = mio::Events::with_capacity(1024);
+    let mut ready_tokens = VecDeque::new();
+    // Invariant: if is_ready() is true for the object represented by token, it is on the ready_tokens queue
 
-    let listener = mio::net::TcpListener::bind(&addr.parse()?)?;
-    poll.register(&listener, LISTENER_TOKEN, mio::Ready::all(), mio::PollOpt::edge())?;
+    let mut listener = Listener {
+        inner: mio::net::TcpListener::bind(&addr.parse()?)?,
+        ready: mio::Ready::readable(),
+    };
+    poll.register(&listener.inner, LISTENER_TOKEN, mio::Ready::all(), mio::PollOpt::edge())?;
+    if listener.is_ready() {
+        ready_tokens.push_back(LISTENER_TOKEN);
+    }
     println!("listening on {}", addr);
 
-    let mut connections = slab::Slab::with_capacity(1024);
-
-    let mut ready_conn_keys = VecDeque::new();
+    let mut connections = slab::Slab::<Connection>::with_capacity(1024);
 
     loop {
-        if ready_conn_keys.is_empty() {
-            let n = poll.poll(&mut events, None)?;
-            // println!("{} events: {:?}", n, events);
+        if ready_tokens.is_empty() {
+            let _n = poll.poll(&mut events, None)?;
+            // println!("{} events: {:?}", _n, events);
 
             for event in events.iter() {
                 // println!("got event {:?}", &event);
                 if event.token() == LISTENER_TOKEN {
-                    match listener.accept() {
-                        Ok((stream, addr)) => {
-                            // println!("got connection from {}", addr);
-                            let entry = connections.vacant_entry();
-                            poll.register(&stream, slab_key_to_token(entry.key()), mio::Ready::all(), mio::PollOpt::edge())?;
-                            let conn = Connection::new(addr, stream);
-                            if conn.is_ready() {
-                                ready_conn_keys.push_back(entry.key());
-                            }
-                            entry.insert(conn);
-
-                        }
-                        Err(e) => {
-                            eprintln!("error while accepting connection: {}", e);
-                        }
+                    let old_is_ready = listener.is_ready();
+                    listener.add_readiness(event.readiness());
+                    if !old_is_ready && listener.is_ready() {
+                        ready_tokens.push_back(event.token());
                     }
                 } else {
                     let key = token_to_slab_key(event.token());
@@ -256,26 +264,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     conn.add_readiness(event.readiness());
                     // println!("conn to {}: old is_ready: {}, new is_ready: {}", conn.peer_addr, old_is_ready, conn.is_ready());
                     if !old_is_ready && conn.is_ready() {
-                        ready_conn_keys.push_back(key);
+                        ready_tokens.push_back(event.token());
                     }
                 }
             }
         }
 
-        while let Some(key) = ready_conn_keys.pop_front() {
-            let conn = connections.get_mut(key).unwrap();
-            if let Err(e) = conn.make_progress() {
-                eprintln!("conn to {}: {}", conn.peer_addr, e);
-                connections.remove(key);
-                continue;
-            }
+        while let Some(token) = ready_tokens.pop_front() {
+            if token == LISTENER_TOKEN {
+                match listener.inner.accept() {
+                    Ok((stream, addr)) => {
+                        // println!("got connection from {}", addr);
 
-            if conn.is_finished() {
-                // println!("conn to {}: finished, removing", conn.peer_addr);
-                connections.remove(key);
-            } else if conn.is_ready() {
-                // println!("conn to {}: still ready, adding back to ready queue", conn.peer_addr);
-                ready_conn_keys.push_back(key);
+                        let entry = connections.vacant_entry();
+
+                        let token = slab_key_to_token(entry.key());
+                        poll.register(&stream, token, mio::Ready::all(), mio::PollOpt::edge())?;
+
+                        let conn = Connection::new(addr, stream);
+                        if conn.is_ready() {
+                            ready_tokens.push_back(token);
+                        }
+                        entry.insert(conn);
+                    }
+
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        listener.ready &= !mio::Ready::readable();
+                        continue;
+                    }
+
+                    Err(e) => {
+                        eprintln!("error while accepting connection: {}", &e);
+                        return Err(e.into());
+                    }
+                }
+
+                if listener.is_ready() {
+                    ready_tokens.push_back(token);
+                }
+            } else {
+                let key = token_to_slab_key(token);
+                let conn = connections.get_mut(key).unwrap();
+                if let Err(e) = conn.make_progress() {
+                    eprintln!("conn to {}: error: {}", conn.peer_addr, e);
+                    connections.remove(key);
+                    continue;
+                }
+
+                if conn.is_finished() {
+                    // println!("conn to {}: finished, removing", conn.peer_addr);
+                    connections.remove(key);
+                } else if conn.is_ready() {
+                    // println!("conn to {}: still ready, adding back to ready queue", conn.peer_addr);
+                    ready_tokens.push_back(token);
+                }
             }
         }
     }
