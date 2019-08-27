@@ -9,7 +9,7 @@ use std::{
 
 const MAX_REQUESTS_PER_CONN: u32 = 100;
 
-fn process_conn(conn: TcpStream) -> Result<(), Box<dyn Error>> {
+fn process_conn(conn: TcpStream, worker: usize) -> Result<(), Box<dyn Error>> {
     let peer_addr = conn.peer_addr()?;
     eprintln!("new connection from {}!", peer_addr);
 
@@ -51,10 +51,10 @@ fn process_conn(conn: TcpStream) -> Result<(), Box<dyn Error>> {
                                      <title>Test page</title>\n\
                                  </head>\n\
                                  <body>\n\
-                                     <p>Hello, your address is {}, current time is {}.</p>\n\
+                                     <p>Hello from worker #{}, your address is {}, current time is {}.</p>\n\
                                  </body>\n\
                              </html>",
-                   peer_addr, now)?;
+                   worker, peer_addr, now)?;
 
             resp.clear();
             write!(resp, "HTTP/1.1 200 OK\r\n\
@@ -85,13 +85,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let listener = Arc::new(TcpListener::bind(address)?);
 
     let mut threads = Vec::new();
-    for _ in 0..4 {
+    for i in 0..4 {
         threads.push(thread::spawn({
             let listener = listener.clone();
             move || {
                 for maybe_conn in listener.incoming() {
                     let conn = maybe_conn.unwrap();
-                    process_conn(conn).unwrap();
+                    process_conn(conn, i).unwrap();
                 }
             }
         }));

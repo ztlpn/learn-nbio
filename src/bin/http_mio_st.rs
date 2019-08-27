@@ -125,7 +125,10 @@ impl Connection {
                             self.ready &= !mio::Ready::readable();
                             return Ok(())
                         }
-                        Err(e) => { return Err(e) }
+                        Err(e) => {
+                            eprintln!("error while reading: {}", &e);
+                            return Err(e)
+                        }
                     }
                 }
 
@@ -142,6 +145,7 @@ impl Connection {
                         Ok(httparse::Status::Complete(nparsed)) => {
                             self.in_pos += nparsed;
 
+                            eprintln!("processing request: {} {}", parsed.method.unwrap(), parsed.path.unwrap());
                             let now = chrono::Local::now().format("%a, %d %b %Y %T %Z");
 
                             use std::fmt::Write;
@@ -201,7 +205,10 @@ impl Connection {
                             return Ok(())
                         }
 
-                        Err(e) => { return Err(e) }
+                        Err(e) => {
+                            eprintln!("error while sending response: {}", &e);
+                            return Err(e)
+                        }
                     }
                 }
 
@@ -246,10 +253,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         if ready_tokens.is_empty() {
             let _n = poll.poll(&mut events, None)?;
-            // println!("{} events: {:?}", _n, events);
+            // eprintln!("{} events: {:?}", _n, events);
 
             for event in events.iter() {
-                // println!("got event {:?}", &event);
+                // eprintln!("got event {:?}", &event);
                 if event.token() == LISTENER_TOKEN {
                     let old_is_ready = listener.is_ready();
                     listener.add_readiness(event.readiness());
