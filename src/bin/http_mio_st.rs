@@ -146,10 +146,13 @@ impl Connection {
                             self.in_pos += nparsed;
 
                             eprintln!("processing request: {} {}", parsed.method.unwrap(), parsed.path.unwrap());
+
+                            // // simulate cpu-intensive work
+                            // std::thread::sleep(std::time::Duration::from_millis(100));
+
                             let now = chrono::Local::now().format("%a, %d %b %Y %T %Z");
 
                             use std::fmt::Write;
-
                             // TODO remove allocation from the hot path
                             let mut payload = String::new();
                             write!(payload, "<html>\n\

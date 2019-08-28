@@ -299,8 +299,10 @@ impl Task for Connection {
                             eprintln!("processing request: {} {}", parsed.method.unwrap(), parsed.path.unwrap());
                             let now = chrono::Local::now().format("%a, %d %b %Y %T %Z");
 
-                            use std::fmt::Write;
+                            // // simulate cpu-intensive work
+                            // std::thread::sleep(std::time::Duration::from_millis(100));
 
+                            use std::fmt::Write;
                             // TODO remove allocation from the hot path
                             let mut payload = String::new();
                             write!(payload, "<html>\n\
