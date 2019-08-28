@@ -7,18 +7,18 @@ use crossbeam::{
     thread,
 };
 
+enum Readiness {
+    Ready,
+    Blocked,
+    Finished,
+}
+
 trait Task {
     fn register(&self, poll: &mio::Poll, token: mio::Token) -> io::Result<()>;
 
     fn reregister(&self, poll: &mio::Poll, token: mio::Token) -> io::Result<()>;
 
-    fn is_ready(&self) -> bool;
-
-    fn add_readiness(&mut self, ready: mio::Ready);
-
-    fn is_finished(&self) -> bool;
-
-    fn make_progress(&mut self, tasks: &Tasks) -> io::Result<()>;
+    fn make_progress(&mut self, tasks: &Tasks) -> io::Result<Readiness>;
 }
 
 type TaskBox = Box<dyn Task + Send>;
@@ -47,16 +47,8 @@ impl Tasks {
 
         let entry = slab.vacant_entry();
         let token = mio::Token(entry.key());
-
-        if task.is_ready() {
-            // insert a placeholder into the slab and the task into the ready_queue
-            entry.insert(None);
-            self.ready_sender.send((task, token)).unwrap();
-        } else {
-            // register the task with poll for later wakeup
-            task.register(&self.poll, token)?;
-            entry.insert(Some(task));
-        }
+        task.register(&self.poll, token)?;
+        entry.insert(Some(task));
 
         Ok(())
     }
@@ -81,20 +73,29 @@ struct TaskHolder<'a> {
 impl<'a> TaskHolder<'a> {
     fn make_progress(&mut self) -> io::Result<()> {
         let mut task = self.task.take().expect("make_progress() called twice!");
-        if let Err(e) = task.make_progress(self.parent) {
-            eprintln!("error while running task with token {}: {}", self.token.0, e);
-            self.parent.slab.lock().unwrap().remove(self.token.0);
-        } else if task.is_finished() {
-            // eprintln!("token {} finished, removing", self.token.0);
-            self.parent.slab.lock().unwrap().remove(self.token.0);
-        } else if task.is_ready() {
-            // eprintln!("token {}: still ready, adding back to ready queue", self.token.0);
-            self.parent.ready_sender.send((task, self.token)).unwrap();
-        } else {
-            let mut slab = self.parent.slab.lock().unwrap();
-            // eprintln!("token {}: blocked, reregistering with poll", self.token.0);
-            task.reregister(&self.parent.poll, self.token)?;
-            slab.get_mut(self.token.0).unwrap().replace(task);
+
+        match task.make_progress(self.parent) {
+            Ok(Readiness::Finished) => {
+                // eprintln!("token {} finished, removing", self.token.0);
+                self.parent.slab.lock().unwrap().remove(self.token.0);
+            }
+
+            Ok(Readiness::Ready) => {
+                // eprintln!("token {}: still ready, adding back to ready queue", self.token.0);
+                self.parent.ready_sender.send((task, self.token)).unwrap();
+            }
+
+            Ok(Readiness::Blocked) => {
+                let mut slab = self.parent.slab.lock().unwrap();
+                // eprintln!("token {}: blocked, reregistering with poll", self.token.0);
+                task.reregister(&self.parent.poll, self.token)?;
+                slab.get_mut(self.token.0).unwrap().replace(task);
+            }
+
+            Err(e) => {
+                eprintln!("error while running task with token {}: {}", self.token.0, e);
+                self.parent.slab.lock().unwrap().remove(self.token.0);
+            }
         }
 
         Ok(())
@@ -110,7 +111,6 @@ impl<'a> Drop for TaskHolder<'a> {
 }
 
 struct Listener {
-    ready: mio::Ready,
     inner: mio::net::TcpListener,
 }
 
@@ -123,30 +123,17 @@ impl Task for Listener {
         poll.reregister(&self.inner, token, mio::Ready::all(), mio::PollOpt::edge() | mio::PollOpt::oneshot())
     }
 
-    fn is_ready(&self) -> bool {
-        self.ready.contains(mio::Ready::readable())
-    }
-
-    fn add_readiness(&mut self, ready: mio::Ready) {
-        self.ready |= ready;
-    }
-
-    fn is_finished(&self) -> bool {
-        false
-    }
-
-    fn make_progress(&mut self, tasks: &Tasks) -> io::Result<()> {
+    fn make_progress(&mut self, tasks: &Tasks) -> io::Result<Readiness> {
         match self.inner.accept() {
             Ok((stream, addr)) => {
                 // println!("got connection from {}", addr);
                 let conn_task = Box::new(Connection::new(addr, stream));
                 tasks.spawn(conn_task)?;
-                Ok(())
+                Ok(Readiness::Ready)
             }
 
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.ready &= !mio::Ready::readable();
-                Ok(())
+                Ok(Readiness::Blocked)
             }
 
             Err(e) => {
@@ -167,7 +154,6 @@ enum State {
 
 struct Connection {
     state: State,
-    ready: mio::Ready,
 
     peer_addr: std::net::SocketAddr,
     stream: mio::net::TcpStream,
@@ -184,7 +170,6 @@ impl Connection {
     fn new(peer_addr: std::net::SocketAddr, stream: mio::net::TcpStream) -> Connection {
         Connection {
             state: State::ReadingRequests,
-            ready: mio::Ready::readable() | mio::Ready::writable(),
 
             peer_addr,
             stream,
@@ -208,35 +193,7 @@ impl Task for Connection {
         poll.reregister(&self.stream, token, mio::Ready::all(), mio::PollOpt::edge() | mio::PollOpt::oneshot())
     }
 
-    fn add_readiness(&mut self, ready: mio::Ready) {
-        self.ready |= ready;
-    }
-
-    fn is_ready(&self) -> bool {
-        match self.state {
-            State::ReadingRequests => {
-                self.ready.contains(mio::Ready::readable())
-            }
-
-            State::Processing => true,
-
-            State::SendingResponse {..} => {
-                self.ready.contains(mio::Ready::writable())
-            }
-
-            State::Closing => true,
-        }
-    }
-
-    fn is_finished(&self) -> bool {
-        if let State::Closing = self.state {
-            true
-        } else {
-            false
-        }
-    }
-
-    fn make_progress(&mut self, _: &Tasks) -> io::Result<()> {
+    fn make_progress(&mut self, _: &Tasks) -> io::Result<Readiness> {
         loop {
             // println!("connection to {}: do work, state: {:?} ready: {:?}", self.peer_addr, self.state, self.ready);
             match self.state {
@@ -265,7 +222,7 @@ impl Task for Connection {
 
                                 // println!("conn to {}: read EOF", self.peer_addr);
                                 self.state = State::Closing;
-                                return Ok(())
+                                return Ok(Readiness::Finished)
                             }
 
                             self.in_end += nread;
@@ -273,8 +230,7 @@ impl Task for Connection {
                             continue;
                         }
                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            self.ready &= !mio::Ready::readable();
-                            return Ok(())
+                            return Ok(Readiness::Blocked)
                         }
                         Err(e) => {
                             eprintln!("error while reading: {}", &e);
@@ -286,7 +242,7 @@ impl Task for Connection {
                 State::Processing => {
                     if self.in_pos == self.in_end {
                         self.state = State::ReadingRequests;
-                        return Ok(());
+                        return Ok(Readiness::Ready);
                     }
 
                     let mut headers = [httparse::EMPTY_HEADER; 16];
@@ -333,7 +289,7 @@ impl Task for Connection {
 
                         Ok(httparse::Status::Partial) => {
                             self.state = State::ReadingRequests;
-                            return Ok(())
+                            return Ok(Readiness::Ready)
                         }
 
                         Err(_) => {
@@ -354,8 +310,7 @@ impl Task for Connection {
                         }
 
                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            self.ready &= !mio::Ready::writable();
-                            return Ok(())
+                            return Ok(Readiness::Blocked)
                         }
 
                         Err(e) => {
@@ -366,7 +321,7 @@ impl Task for Connection {
                 }
 
                 State::Closing => {
-                    return Ok(());
+                    return Ok(Readiness::Finished);
                 }
             }
         }
@@ -380,7 +335,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = Box::new(
         Listener {
             inner: mio::net::TcpListener::bind(&addr.parse()?)?,
-            ready: mio::Ready::readable(),
         });
     tasks.spawn(listener)?;
     println!("listening on {}", addr);
@@ -396,13 +350,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // eprintln!("got event {:?}", &event);
                     let key = event.token().0;
                     let task_slot = slab.get_mut(key).expect("got token for nonexistent task");
-                    let mut task = task_slot.take().unwrap();
-                    task.add_readiness(event.readiness());
-                    if task.is_ready() {
+                    if let Some(task) = task_slot.take() {
                         tasks.ready_sender.send((task, event.token())).unwrap();
-                    } else {
-                        task.reregister(&tasks.poll, event.token()).unwrap();
-                        task_slot.replace(task);
                     }
                 }
             }
