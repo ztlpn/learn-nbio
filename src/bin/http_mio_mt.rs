@@ -71,8 +71,8 @@ struct TaskHolder<'a> {
 }
 
 impl<'a> TaskHolder<'a> {
-    fn make_progress(&mut self) -> io::Result<()> {
-        let mut task = self.task.take().expect("make_progress() called twice!");
+    fn make_progress(mut self) -> io::Result<()> {
+        let mut task = self.task.take().unwrap();
 
         match task.make_progress(self.parent) {
             Ok(Readiness::Finished) => {
@@ -360,7 +360,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for _ in 0..4 {
             scope.spawn(|_| {
                 loop {
-                    let mut task_holder = tasks.dequeue();
+                    let task_holder = tasks.dequeue();
                     task_holder.make_progress().unwrap();
                 }
             });
