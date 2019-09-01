@@ -10,4 +10,5 @@ chrono = "0.4.7"
 mio = "0.6"
 slab = "0.4"
 crossbeam = "0.7"
-tokio = "0.1"
+tokio01 = { package="tokio", version="0.1" }
+tokio02 = { package="tokio", version="=0.2.0-alpha.4" }

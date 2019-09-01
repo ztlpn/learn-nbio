@@ -1,3 +1,5 @@
+use tokio01 as tokio;
+
 use tokio::{
     prelude::*,
 };
