@@ -45,7 +45,7 @@ impl AsMut<[u8]> for RequestBuf {
 }
 
 fn process_conn(conn: tokio::net::TcpStream) -> impl Future<Item = (), Error = ()> {
-    let peer_addr = conn.peer_addr().unwrap(); // XXX: unwrap
+    let peer_addr = conn.peer_addr().unwrap().to_string(); // XXX: unwrap
     let (reader, writer) = conn.split();
     let reader = std::io::BufReader::new(reader);
 
@@ -68,63 +68,25 @@ fn process_conn(conn: tokio::net::TcpStream) -> impl Future<Item = (), Error = (
 
                 in_buf.end += nread;
 
-                let mut headers = [httparse::EMPTY_HEADER; 16];
-                let mut request = httparse::Request::new(&mut headers);
-                let parsed = request.parse(&in_buf.buf[in_buf.pos..in_buf.end]);
-                let response = match parsed {
-                    Ok(httparse::Status::Complete(nparsed)) => {
+                let mut response = Vec::new();
+                match rust_http::process_request(&in_buf.buf[in_buf.pos..in_buf.end], &peer_addr, &mut response) {
+                    Ok(Some(nparsed)) => {
                         in_buf.pos += nparsed;
-
-                        eprintln!("processing request: {} {}", request.method.unwrap(), request.path.unwrap());
-
-                        // // simulate cpu-intensive work
-                        // std::thread::sleep(std::time::Duration::from_millis(100));
-
-                        let now = chrono::Local::now().format("%a, %d %b %Y %T %Z");
-
-                        use std::fmt::Write;
-                        // TODO remove allocation from the hot path
-                        let mut payload = String::new();
-                        write!(payload, "<html>\n\
-                                         <head>\n\
-                                         <title>Test page</title>\n\
-                                         </head>\n\
-                                         <body>\n\
-                                         <p>Hello, your address is {}, current time is {}.</p>\n\
-                                         </body>\n\
-                                         </html>",
-                               peer_addr, now).unwrap();
-
-                        let mut response = Vec::new();
-                        write!(response, "HTTP/1.1 200 OK\r\n\
-                                          Server: MyHTTP\r\n\
-                                          Content-Type: text/html\r\n\
-                                          Content-Length: {}\r\n\
-                                          Date: {}\r\n\
-                                          \r\n\
-                                          {}\r\n",
-                               payload.len(), now, payload).unwrap();
-                        response
+                        future::Either::B(
+                            tokio::io::write_all(writer, response)
+                                .and_then(move |(writer, _)| {
+                                    Ok(future::Loop::Continue((peer_addr, reader, in_buf, writer)))
+                                }))
                     }
 
-                    Ok(httparse::Status::Partial) => {
-                        return future::Either::A(
+                    Ok(None) => {
+                        future::Either::A(
                             future::ok(
-                                future::Loop::Continue((peer_addr, reader, in_buf, writer))));
+                                future::Loop::Continue((peer_addr, reader, in_buf, writer))))
                     }
 
-                    Err(_) =>  {
-                        return future::Either::A(
-                            future::err(
-                                io::Error::new(io::ErrorKind::InvalidData, "could not parse request")));
-                    }
-                };
-
-                future::Either::B(
-                    tokio::io::write_all(writer, response)
-                        .and_then(move |(writer, _)| {
-                            Ok(future::Loop::Continue((peer_addr, reader, in_buf, writer)))
-                        }))
+                    Err(e) => future::Either::A(future::err(e)),
+                }
             })
         })
     }).map_err(|e| {

@@ -155,7 +155,7 @@ enum State {
 struct Connection {
     state: State,
 
-    peer_addr: std::net::SocketAddr,
+    peer_addr: String,
     stream: mio::net::TcpStream,
 
     in_buf: Vec<u8>,
@@ -171,7 +171,7 @@ impl Connection {
         Connection {
             state: State::ReadingRequests,
 
-            peer_addr,
+            peer_addr: peer_addr.to_string(),
             stream,
 
             in_buf: vec![0u8; 4096],
@@ -245,55 +245,18 @@ impl Task for Connection {
                         return Ok(Readiness::Ready);
                     }
 
-                    let mut headers = [httparse::EMPTY_HEADER; 16];
-                    let mut parsed = httparse::Request::new(&mut headers);
-                    let res = parsed.parse(&self.in_buf[self.in_pos..self.in_end]);
-                    match res {
-                        Ok(httparse::Status::Complete(nparsed)) => {
-                            self.in_pos += nparsed;
+                    match rust_http::process_request(
+                        &self.in_buf[self.in_pos..self.in_end], &self.peer_addr, &mut self.out_buf)? {
 
-                            eprintln!("processing request: {} {}", parsed.method.unwrap(), parsed.path.unwrap());
-                            let now = chrono::Local::now().format("%a, %d %b %Y %T %Z");
-
-                            // // simulate cpu-intensive work
-                            // std::thread::sleep(std::time::Duration::from_millis(100));
-
-                            use std::fmt::Write;
-                            // TODO remove allocation from the hot path
-                            let mut payload = String::new();
-                            write!(payload, "<html>\n\
-                                             <head>\n\
-                                             <title>Test page</title>\n\
-                                             </head>\n\
-                                             <body>\n\
-                                             <p>Hello, your address is {}, current time is {}.</p>\n\
-                                             </body>\n\
-                                             </html>",
-                                   self.peer_addr, now).unwrap();
-
-                            self.out_buf.clear();
-                            self.out_pos = 0;
-
-                            write!(self.out_buf, "HTTP/1.1 200 OK\r\n\
-                                                  Server: MyHTTP\r\n\
-                                                  Content-Type: text/html\r\n\
-                                                  Content-Length: {}\r\n\
-                                                  Date: {}\r\n\
-                                                  \r\n\
-                                                  {}\r\n",
-                                   payload.len(), now, payload).unwrap();
-
+                        Some(request_nbytes) => {
+                            self.in_pos += request_nbytes;
                             self.state = State::SendingResponse;
                             continue;
                         }
 
-                        Ok(httparse::Status::Partial) => {
+                        None => {
                             self.state = State::ReadingRequests;
                             return Ok(Readiness::Ready)
-                        }
-
-                        Err(_) => {
-                            return Err(io::Error::new(io::ErrorKind::InvalidData, "could not parse request"));
                         }
                     }
                 }
@@ -357,7 +320,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
-        for _ in 0..4 {
+        for _ in 0..3 {
             scope.spawn(|_| {
                 loop {
                     let task_holder = tasks.dequeue();
