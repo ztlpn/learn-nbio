@@ -236,6 +236,8 @@ impl Task for Connection {
                         Ok(nwritten) => {
                             self.out_pos += nwritten;
                             if self.out_pos == self.out_buf.len() {
+                                self.out_buf.clear();
+                                self.out_pos = 0;
                                 self.state = State::Processing;
                             }
 
