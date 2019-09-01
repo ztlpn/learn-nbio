@@ -1,41 +1,33 @@
 use std::{
     result::Result,
     error::Error,
-    io::{self, Read, Write},
+    io::{Read, Write},
     net::{TcpListener, TcpStream},
     thread,
 };
+
+use rust_http::{ RequestBuf, process_request };
 
 fn process_conn(conn: TcpStream) -> Result<(), Box<dyn Error>> {
     let peer_addr = conn.peer_addr()?.to_string();
     eprintln!("new connection from {}!", peer_addr);
 
-    let mut buf = [0u8; 4096];
-    let mut pos = 0;
+    let mut in_buf = RequestBuf::new();
     let mut resp = Vec::new();
 
     loop {
-        let nread = (&conn).read(&mut buf[pos..])?;
+        in_buf.rewind()?;
+        let nread = (&conn).read(in_buf.as_mut())?;
+
+        in_buf.advance(nread)?;
         if nread == 0 {
             eprintln!("client closed the connection");
-            if pos == 0 {
-                return Ok(());
-            } else {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "client sent incomplete request").into());
-            }
-        }
-        pos += nread;
-
-        if pos == buf.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "request too big").into());
+            return Ok(());
         }
 
         resp.clear();
-        if let Some(_) = rust_http::process_request(&buf[..pos], &peer_addr, &mut resp)? {
+        if process_request(&mut in_buf, &peer_addr, &mut resp)? {
             (&conn).write_all(&resp)?;
-            // read and process the next request in this connection.
-            resp.clear();
-            pos = 0;
         }
     }
 }

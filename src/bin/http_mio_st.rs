@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::io::{ self, prelude::* };
 
+use rust_http::{ RequestBuf, process_request };
+
 #[derive(Debug)]
 enum State {
     ReadingRequests,
@@ -31,9 +33,7 @@ struct Connection {
     peer_addr: String,
     stream: mio::net::TcpStream,
 
-    in_buf: Vec<u8>,
-    in_pos: usize,
-    in_end: usize,
+    in_buf: RequestBuf,
 
     out_buf: Vec<u8>,
     out_pos: usize,
@@ -48,9 +48,7 @@ impl Connection {
             peer_addr: peer_addr.to_string(),
             stream,
 
-            in_buf: vec![0u8; 4096],
-            in_pos: 0,
-            in_end: 0,
+            in_buf: RequestBuf::new(),
 
             out_buf: Vec::new(),
             out_pos: 0,
@@ -90,34 +88,17 @@ impl Connection {
             // println!("connection to {}: do work, state: {:?} ready: {:?}", self.peer_addr, self.state, self.ready);
             match self.state {
                 State::ReadingRequests => {
-                    if self.in_pos == self.in_buf.len() {
-                        // we've read the full request and it ended exactly at the end of the buffer.
-                        self.in_pos = 0;
-                        self.in_end = 0;
-                    } else if self.in_end == self.in_buf.len() {
-                        if self.in_pos == 0 {
-                            return Err(io::Error::new(io::ErrorKind::InvalidData, "request too big"));
-                        } else {
-                            // we've read part of the request and need to copy it to the beginning of the buffer to read the rest
-                            self.in_buf.rotate_left(self.in_pos);
-                            self.in_end = self.in_end - self.in_pos;
-                            self.in_pos = 0;
-                        }
-                    }
+                    self.in_buf.rewind()?;
 
-                    match self.stream.read(&mut self.in_buf[self.in_end..]) {
+                    match self.stream.read(self.in_buf.as_mut()) {
                         Ok(nread) => {
+                            self.in_buf.advance(nread)?;
                             if nread == 0 {
-                                if self.in_pos != self.in_end {
-                                    return Err(io::Error::new(io::ErrorKind::InvalidData, "incomplete request"));
-                                }
-
                                 // println!("conn to {}: read EOF", self.peer_addr);
                                 self.state = State::Closing;
                                 return Ok(())
                             }
 
-                            self.in_end += nread;
                             self.state = State::Processing;
                             continue;
                         }
@@ -133,24 +114,12 @@ impl Connection {
                 }
 
                 State::Processing => {
-                    if self.in_pos == self.in_end {
+                    if process_request(&mut self.in_buf, &self.peer_addr, &mut self.out_buf)? {
+                        self.state = State::SendingResponse;
+                        continue;
+                    } else  {
                         self.state = State::ReadingRequests;
-                        return Ok(());
-                    }
-
-                    match rust_http::process_request(
-                        &self.in_buf[self.in_pos..self.in_end], &self.peer_addr, &mut self.out_buf)? {
-
-                        Some(request_nbytes) => {
-                            self.in_pos += request_nbytes;
-                            self.state = State::SendingResponse;
-                            continue;
-                        }
-
-                        None => {
-                            self.state = State::ReadingRequests;
-                            return Ok(())
-                        }
+                        return Ok(())
                     }
                 }
 
