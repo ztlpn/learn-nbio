@@ -51,7 +51,7 @@ impl AsMut<[u8]> for RequestBuf {
 
 /// return true if the request was processed
 pub fn process_request(in_buf: &mut RequestBuf, peer_addr: &str, out_buf: &mut impl io::Write)
-        -> Result<bool, io::Error> {
+                       -> Result<bool, io::Error> {
     let mut headers = [httparse::EMPTY_HEADER; 16];
     let mut parsed = httparse::Request::new(&mut headers);
     let res = parsed.parse(&in_buf.buf[in_buf.pos..in_buf.end]);
@@ -86,7 +86,7 @@ pub fn process_request(in_buf: &mut RequestBuf, peer_addr: &str, out_buf: &mut i
                              Date: {}\r\n\
                              \r\n\
                              {}\r\n",
-                   payload.len(), now, payload).unwrap();
+                   payload.len() + 2, now, payload).unwrap();
 
             Ok(true)
         }

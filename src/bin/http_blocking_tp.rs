@@ -66,7 +66,7 @@ fn process_conn(conn: TcpStream, worker: usize) -> Result<(), Box<dyn Error>> {
                           \r\n\
                           {}\r\n",
                    if num_processed < MAX_REQUESTS_PER_CONN { "" } else { "Connection: close\r\n" },
-                   payload.len(), now, payload)?;
+                   payload.len() + 2, now, payload)?;
 
             (&conn).write_all(resp.as_bytes())?;
 

@@ -53,7 +53,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                               Connection: close\r\n\
                               \r\n\
                               {}\r\n",
-                       payload.len(), now, payload)?;
+                       payload.len() + 2, now, payload)?;
 
                 (&conn).write_all(resp.as_bytes())?;
                 eprintln!("written all");
