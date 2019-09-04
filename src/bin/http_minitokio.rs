@@ -1,7 +1,7 @@
 #![feature(try_blocks)]
 
 use std::{
-    sync::Arc,
+    sync::{Arc, Weak},
     cell::{RefCell, RefMut},
     pin::Pin,
     future::Future,
@@ -174,7 +174,7 @@ impl Runtime {
 }
 
 struct Registration {
-    runtime: RuntimeInnerHandle,
+    runtime: Weak<RefCell<RuntimeInner>>, // storing Weak to runtime to avoid cycles during cancellation.
     key: usize,
 }
 
@@ -206,9 +206,17 @@ impl Future for ReadFuture<'_, '_> {
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 match &this.registration {
                     Some(Registration { runtime, key }) => {
-                        runtime.borrow_mut()
-                            .io_resources.get_mut(*key).expect("unknown io resource")
-                            .push(ctx.waker().clone());
+                        match Weak::upgrade(runtime) {
+                            Some(runtime) => {
+                                runtime.borrow_mut()
+                                    .io_resources.get_mut(*key).expect("unknown io resource")
+                                    .push(ctx.waker().clone());
+                            }
+
+                            None => return task::Poll::Ready(Err(
+                                io::Error::new(
+                                    io::ErrorKind::Other, "runtime already dropped"))),
+                        }
                     }
 
                     None => {
@@ -226,7 +234,7 @@ impl Future for ReadFuture<'_, '_> {
                             return task::Poll::Ready(Err(e))
                         }
                         entry.insert(vec![ctx.waker().clone()]);
-                        this.registration = Some(Registration { runtime: runtime.clone(), key });
+                        this.registration = Some(Registration { runtime: Arc::downgrade(&runtime), key });
                     }
                 }
 
