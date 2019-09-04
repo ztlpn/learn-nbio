@@ -178,21 +178,79 @@ struct Registration {
     key: usize,
 }
 
-struct ReadFuture<'a, 'b> {
-    stream: &'a mio::net::TcpStream,
+struct IoResource<T: mio::Evented> {
+    inner: T,
     registration: Option<Registration>,
-
-    buf: &'b mut [u8],
 }
 
-impl ReadFuture<'_, '_> {
-    fn new<'a, 'b>(stream: &'a mio::net::TcpStream, buf: &'b mut [u8]) -> ReadFuture<'a, 'b> {
-        ReadFuture {
-            stream,
-            registration: None,
-            buf,
+impl<T: mio::Evented> IoResource<T> {
+    fn register(&mut self, interest: mio::Ready, waker: task::Waker) -> io::Result<()> {
+        match self.registration {
+            Some(Registration { ref runtime, key }) => {
+                match Weak::upgrade(runtime) {
+                    Some(runtime) => {
+                        let (mut io_resources, poll) = RefMut::map_split(
+                            runtime.borrow_mut(),
+                            |r| (&mut r.io_resources, &mut r.poll));
+                        poll.reregister(
+                            &self.inner, mio::Token(key), interest, mio::PollOpt::edge() | mio::PollOpt::oneshot())?;
+                        io_resources.get_mut(key).expect("unknown io resource")
+                            .push(waker);
+                    }
+
+                    None => return Err(
+                        io::Error::new(
+                            io::ErrorKind::Other, "runtime already dropped")),
+                }
+            }
+
+            None => {
+                // register the waker with poll.
+                // waker is associated with toplevel future
+                // , so we must save the association io_resource -> waker somewhere.
+                let runtime = current_runtime();
+                let (mut io_resources, poll) = RefMut::map_split(
+                    runtime.borrow_mut(),
+                    |r| (&mut r.io_resources, &mut r.poll));
+                let entry = io_resources.vacant_entry();
+                let key = entry.key();
+                poll.register(&self.inner, mio::Token(key), interest, mio::PollOpt::edge() | mio::PollOpt::oneshot())?;
+                entry.insert(vec![waker]);
+                self.registration = Some(Registration { runtime: Arc::downgrade(&runtime), key });
+            }
         }
+
+        Ok(())
     }
+}
+
+struct TcpStream {
+    resource: IoResource<mio::net::TcpStream>,
+}
+
+impl TcpStream {
+    fn connect(addr: &std::net::SocketAddr) -> io::Result<TcpStream> {
+        Ok(TcpStream {
+            resource: IoResource {
+                inner: mio::net::TcpStream::connect(addr)?,
+                registration: None,
+            }
+        })
+    }
+
+
+    fn read<'a, 'b>(&'a mut self, buf: &'b mut [u8]) -> ReadFuture<'a, 'b> {
+        ReadFuture { stream: self, buf }
+    }
+
+    fn write<'a, 'b>(&'a mut self, buf: &'b [u8]) -> WriteFuture<'a, 'b> {
+        WriteFuture { stream: self, buf }
+    }
+}
+
+struct ReadFuture<'a, 'b> {
+    stream: &'a mut TcpStream,
+    buf: &'b mut [u8],
 }
 
 impl Future for ReadFuture<'_, '_> {
@@ -200,44 +258,38 @@ impl Future for ReadFuture<'_, '_> {
 
     fn poll(self: Pin<&mut Self>, ctx: &mut task::Context) -> task::Poll<io::Result<usize>> {
         let this = self.get_mut();
-        match this.stream.read(this.buf) {
+        match this.stream.resource.inner.read(this.buf) {
             Ok(nread) => task::Poll::Ready(Ok(nread)),
 
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                match &this.registration {
-                    Some(Registration { runtime, key }) => {
-                        match Weak::upgrade(runtime) {
-                            Some(runtime) => {
-                                runtime.borrow_mut()
-                                    .io_resources.get_mut(*key).expect("unknown io resource")
-                                    .push(ctx.waker().clone());
-                            }
-
-                            None => return task::Poll::Ready(Err(
-                                io::Error::new(
-                                    io::ErrorKind::Other, "runtime already dropped"))),
-                        }
-                    }
-
-                    None => {
-                        // register the waker with poll.
-                        // waker is associated with toplevel future
-                        // , so we must save the association io_resource -> waker somewhere.
-                        let runtime = current_runtime();
-                        let (mut io_resources, poll) = RefMut::map_split(
-                            runtime.borrow_mut(),
-                            |r| (&mut r.io_resources, &mut r.poll));
-                        let entry = io_resources.vacant_entry();
-                        let key = entry.key();
-                        if let Err(e) = poll.register(
-                            this.stream, mio::Token(key), mio::Ready::readable(), mio::PollOpt::edge()) {
-                            return task::Poll::Ready(Err(e))
-                        }
-                        entry.insert(vec![ctx.waker().clone()]);
-                        this.registration = Some(Registration { runtime: Arc::downgrade(&runtime), key });
-                    }
+                if let Err(e) = this.stream.resource.register(mio::Ready::readable(), ctx.waker().clone()) {
+                    return task::Poll::Ready(Err(e))
                 }
+                task::Poll::Pending
+            }
 
+            Err(e) => task::Poll::Ready(Err(e)),
+        }
+    }
+}
+
+struct WriteFuture<'a, 'b> {
+    stream: &'a mut TcpStream,
+    buf: &'b [u8],
+}
+
+impl Future for WriteFuture<'_, '_> {
+    type Output = io::Result<usize>;
+
+    fn poll(self: Pin<&mut Self>, ctx: &mut task::Context) -> task::Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match this.stream.resource.inner.write(this.buf) {
+            Ok(nwritten) => task::Poll::Ready(Ok(nwritten)),
+
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if let Err(e) = this.stream.resource.register(mio::Ready::writable(), ctx.waker().clone()) {
+                    return task::Poll::Ready(Err(e))
+                }
                 task::Poll::Pending
             }
 
@@ -252,15 +304,21 @@ fn main() -> io::Result<()> {
         let res: Result<(), Box<dyn std::error::Error>> = try {
             let addr = std::env::args().nth(1).unwrap_or("127.0.0.1:8000".to_string());
             println!("connecting to {}", addr);
-            let stream = mio::net::TcpStream::connect(&addr.parse()?)?;
+            let mut stream = TcpStream::connect(&addr.parse()?)?;
             let mut buf = [0u8; 4096];
             loop {
-                let nread = ReadFuture::new(&stream, &mut buf).await?;
+                let nread = stream.read(&mut buf).await?;
                 if nread == 0 {
                     println!("server ended the connection");
                     break;
                 } else {
-                    println!("read: {}", String::from_utf8(buf[..nread].to_vec())?);
+                    let text = String::from_utf8(buf[..nread].to_vec())?;
+                    println!("read: {}", text);
+                    let reply = "Hello, ".to_owned() + &text;
+                    let mut pos = 0;
+                    while pos < reply.as_bytes().len() {
+                        pos += stream.write(&reply.as_bytes()[pos..]).await?;
+                    }
                 }
             }
         };
