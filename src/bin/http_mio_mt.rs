@@ -8,7 +8,7 @@ use crossbeam::{
     thread,
 };
 
-use rust_http::{ RequestBuf, process_request };
+use nbio::{ RequestBuf, process_request };
 
 enum Readiness {
     Ready,

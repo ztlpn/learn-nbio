@@ -6,7 +6,7 @@ use std::{
     thread,
 };
 
-use rust_http::{ RequestBuf, process_request };
+use nbio::{ RequestBuf, process_request };
 
 fn process_conn(conn: TcpStream) -> Result<(), Box<dyn Error>> {
     let peer_addr = conn.peer_addr()?.to_string();

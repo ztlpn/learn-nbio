@@ -1,5 +1,5 @@
 [package]
-name = "rust_http"
+name = "nbio"
 version = "0.1.0"
 authors = ["Alex Zatelepin <mvzp10@gmail.com>"]
 edition = "2018"

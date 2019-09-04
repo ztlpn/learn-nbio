@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{ self, prelude::* };
 
-use rust_http::{ RequestBuf, process_request };
+use nbio::{ RequestBuf, process_request };
 
 #[derive(Debug)]
 enum State {

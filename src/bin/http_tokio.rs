@@ -4,7 +4,7 @@ use tokio::{
     prelude::*,
 };
 
-use rust_http::{ RequestBuf, process_request };
+use nbio::{ RequestBuf, process_request };
 
 fn process_conn(conn: tokio::net::TcpStream) -> impl Future<Item = (), Error = ()> {
     let peer_addr = conn.peer_addr().unwrap().to_string(); // XXX: unwrap

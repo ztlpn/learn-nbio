@@ -1,3 +1,3 @@
-# rust-http
+# Learn non-blocking IO
 
-Learning of various ways of writing a http server in rust.
+Exploring various ways of doing non-blocking IO in rust by writing http servers.
