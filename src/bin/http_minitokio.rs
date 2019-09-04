@@ -224,12 +224,12 @@ impl<T: mio::Evented> IoResource<T> {
     }
 }
 
-struct TcpStream {
+pub struct TcpStream {
     resource: IoResource<mio::net::TcpStream>,
 }
 
 impl TcpStream {
-    fn connect(addr: &std::net::SocketAddr) -> io::Result<TcpStream> {
+    pub fn connect(addr: &std::net::SocketAddr) -> io::Result<TcpStream> {
         Ok(TcpStream {
             resource: IoResource {
                 inner: mio::net::TcpStream::connect(addr)?,
@@ -239,16 +239,16 @@ impl TcpStream {
     }
 
 
-    fn read<'a, 'b>(&'a mut self, buf: &'b mut [u8]) -> ReadFuture<'a, 'b> {
+    pub fn read<'a, 'b>(&'a mut self, buf: &'b mut [u8]) -> ReadFuture<'a, 'b> {
         ReadFuture { stream: self, buf }
     }
 
-    fn write<'a, 'b>(&'a mut self, buf: &'b [u8]) -> WriteFuture<'a, 'b> {
+    pub fn write<'a, 'b>(&'a mut self, buf: &'b [u8]) -> WriteFuture<'a, 'b> {
         WriteFuture { stream: self, buf }
     }
 }
 
-struct ReadFuture<'a, 'b> {
+pub struct ReadFuture<'a, 'b> {
     stream: &'a mut TcpStream,
     buf: &'b mut [u8],
 }
@@ -273,7 +273,7 @@ impl Future for ReadFuture<'_, '_> {
     }
 }
 
-struct WriteFuture<'a, 'b> {
+pub struct WriteFuture<'a, 'b> {
     stream: &'a mut TcpStream,
     buf: &'b [u8],
 }
@@ -298,28 +298,93 @@ impl Future for WriteFuture<'_, '_> {
     }
 }
 
+pub struct TcpListener {
+    resource: IoResource<mio::net::TcpListener>,
+}
+
+impl TcpListener {
+    pub fn bind(addr: &std::net::SocketAddr) -> io::Result<TcpListener> {
+        Ok(TcpListener {
+            resource: IoResource {
+                inner: mio::net::TcpListener::bind(addr)?,
+                registration: None,
+            }
+        })
+    }
+
+
+    pub fn accept(&mut self) -> AcceptFuture {
+        AcceptFuture { listener: self }
+    }
+}
+
+pub struct AcceptFuture<'a> {
+    listener: &'a mut TcpListener,
+}
+
+impl Future for AcceptFuture<'_> {
+    type Output = io::Result<(TcpStream, std::net::SocketAddr)>;
+
+    fn poll(self: Pin<&mut Self>, ctx: &mut task::Context) -> task::Poll<Self::Output> {
+        let this = self.get_mut();
+        match this.listener.resource.inner.accept() {
+            Ok((stream, addr)) => task::Poll::Ready(Ok(
+                (TcpStream {
+                    resource: IoResource {
+                        inner: stream,
+                        registration: None,
+                    }
+                },
+                addr))),
+
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if let Err(e) = this.listener.resource.register(mio::Ready::readable(), ctx.waker().clone()) {
+                    return task::Poll::Ready(Err(e))
+                }
+                task::Poll::Pending
+            }
+
+            Err(e) => task::Poll::Ready(Err(e)),
+        }
+    }
+}
+
 fn main() -> io::Result<()> {
     let mut runtime = Runtime::new()?;
     runtime.run(async move {
         let res: Result<(), Box<dyn std::error::Error>> = try {
             let addr = std::env::args().nth(1).unwrap_or("127.0.0.1:8000".to_string());
-            println!("connecting to {}", addr);
-            let mut stream = TcpStream::connect(&addr.parse()?)?;
-            let mut buf = [0u8; 4096];
+            let mut listener = TcpListener::bind(&addr.parse()?)?;
+            println!("listening on {}", addr);
+
             loop {
-                let nread = stream.read(&mut buf).await?;
-                if nread == 0 {
-                    println!("server ended the connection");
-                    break;
-                } else {
-                    let text = String::from_utf8(buf[..nread].to_vec())?;
-                    println!("read: {}", text);
-                    let reply = "Hello, ".to_owned() + &text;
-                    let mut pos = 0;
-                    while pos < reply.as_bytes().len() {
-                        pos += stream.write(&reply.as_bytes()[pos..]).await?;
+                let (mut stream, addr) = listener.accept().await?;
+                println!("accepted connection from {}!", addr);
+
+                spawn(async move {
+                    let res: Result<(), Box<dyn std::error::Error>> = try {
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            let nread = stream.read(&mut buf).await?;
+                            if nread == 0 {
+                                println!("client ended the connection");
+                                break;
+                            } else {
+                                let text = String::from_utf8(buf[..nread].to_vec())?;
+                                println!("read: {}", text);
+                                let reply = "Hello, ".to_owned() + &text;
+                                let mut pos = 0;
+                                while pos < reply.as_bytes().len() {
+                                    pos += stream.write(&reply.as_bytes()[pos..]).await?;
+                                }
+                            }
+                        }
+                    };
+
+                    if let Err(e) = res {
+                        eprintln!("error on connection from {}: {}", addr, e);
                     }
-                }
+                });
             }
         };
 
