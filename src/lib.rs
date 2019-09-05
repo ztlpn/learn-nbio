@@ -1,5 +1,7 @@
 use std::io;
 
+pub mod minitokio;
+
 pub struct RequestBuf {
     buf: Vec<u8>,
     pos: usize,
