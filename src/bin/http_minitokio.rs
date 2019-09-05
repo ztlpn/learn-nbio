@@ -3,12 +3,43 @@
 use {
     std::io::self,
 
-    nbio::minitokio::{
-        Runtime,
-        spawn,
-        TcpListener,
+    nbio::{
+        minitokio::{
+            self,
+            Runtime,
+            TcpListener,
+            TcpStream,
+        },
+
+        RequestBuf,
+        process_request,
     }
 };
+
+async fn process_conn(mut conn: TcpStream, peer_addr: String)
+                      -> Result<(), Box<dyn std::error::Error>> {
+    let mut in_buf = RequestBuf::new();
+    let mut resp = Vec::new();
+
+    loop {
+        in_buf.rewind()?;
+        let nread = conn.read(in_buf.as_mut()).await?;
+
+        in_buf.advance(nread)?;
+        if nread == 0 {
+            eprintln!("client closed the connection from {}", peer_addr);
+            return Ok(());
+        }
+
+        resp.clear();
+        if process_request(&mut in_buf, &peer_addr, &mut resp)? {
+            let mut pos = 0;
+            while pos < resp.len() {
+                pos += conn.write(&resp[pos..]).await?;
+            }
+        }
+    }
+}
 
 fn main() -> io::Result<()> {
     let mut runtime = Runtime::new()?;
@@ -19,38 +50,17 @@ fn main() -> io::Result<()> {
             println!("listening on {}", addr);
 
             loop {
-                let (mut stream, addr) = listener.accept().await?;
-                println!("accepted connection from {}!", addr);
-
-                spawn(async move {
-                    let res: Result<(), Box<dyn std::error::Error>> = try {
-                        let mut buf = [0u8; 4096];
-                        loop {
-                            let nread = stream.read(&mut buf).await?;
-                            if nread == 0 {
-                                println!("client ended the connection");
-                                break;
-                            } else {
-                                let text = String::from_utf8(buf[..nread].to_vec())?;
-                                println!("read: {}", text);
-                                let reply = "Hello, ".to_owned() + &text;
-                                let mut pos = 0;
-                                while pos < reply.as_bytes().len() {
-                                    pos += stream.write(&reply.as_bytes()[pos..]).await?;
-                                }
-                            }
-                        }
-                    };
-
-                    if let Err(e) = res {
-                        eprintln!("error on connection from {}: {}", addr, e);
+                let (conn, peer_addr) = listener.accept().await?;
+                minitokio::spawn(async move {
+                    if let Err(e) = process_conn(conn, peer_addr.to_string()).await {
+                        eprintln!("error while processing connection from {}: {}", peer_addr, e);
                     }
                 });
             }
         };
 
         if let Err(e) = res {
-            eprintln!("error: {}", e);
+            eprintln!("error while listening: {}", e);
         }
     })
 }
