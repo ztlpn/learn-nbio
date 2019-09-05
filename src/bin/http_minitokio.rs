@@ -178,6 +178,14 @@ struct Registration {
     key: usize,
 }
 
+impl Drop for Registration {
+    fn drop(&mut self) {
+        if let Some(runtime) = Weak::upgrade(&self.runtime) {
+            runtime.borrow_mut().io_resources.remove(self.key);
+        }
+    }
+}
+
 struct IoResource<T: mio::Evented> {
     inner: T,
     registration: Option<Registration>,
