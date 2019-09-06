@@ -42,7 +42,7 @@ async fn process_conn(mut conn: TcpStream, peer_addr: String)
 }
 
 fn main() -> io::Result<()> {
-    let mut runtime = Runtime::new()?;
+    let mut runtime = Runtime::new(3)?;
     runtime.run(async move {
         let res: Result<(), Box<dyn std::error::Error>> = try {
             let addr = std::env::args().nth(1).unwrap_or("127.0.0.1:8000".to_string());

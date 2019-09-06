@@ -1,69 +1,175 @@
 use std::{
-    sync::{Arc, Weak},
-    cell::{RefCell, RefMut},
+    sync::{Arc, Weak, Mutex},
+    cell::RefCell,
     pin::Pin,
     future::Future,
     task,
     io::{ self, prelude::* },
-    collections::VecDeque,
 };
 
 use slab::Slab;
 
-// that's the toplevel future
-type TaskBox = Pin<Box<dyn Future<Output = ()>>>;
+use crossbeam::{
+    channel,
+};
 
-struct RuntimeInner {
-    poll: mio::Poll,
-    io_resources: Slab<Vec<task::Waker>>,
-    // toplevel futures go here. the task is either in tasks or in ready_queue.
-    tasks: Slab<Option<TaskBox>>,
-    ready_queue: VecDeque<(TaskBox, usize)>,
+struct ScopeGuard<T: FnOnce() -> ()> {
+    on_exit: Option<T>
 }
 
-impl RuntimeInner {
-    fn spawn<T>(&mut self, task: T) where T: Future<Output = ()> + 'static {
-        let pinned = Box::pin(task);
-        let key = self.tasks.insert(None);
-        self.ready_queue.push_back((pinned, key));
+impl<T: FnOnce() -> ()> Drop for ScopeGuard<T> {
+    fn drop(&mut self) {
+        let on_exit = self.on_exit.take().unwrap();
+        on_exit();
     }
 }
 
-type RuntimeInnerHandle = Arc<RefCell<RuntimeInner>>;
+// a task is a toplevel future that is driven by the executor.
+type TaskBox = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-pub struct Runtime {
-    inner: RuntimeInnerHandle,
+// current state of the task in the executor
+enum TaskState {
+    Waiting(TaskBox),
+    Executing,
+     // the task is currently executing and has signalled that it is ready to be executed again immediately.
+    ScheduledAgain,
+}
+
+struct ExecutorInner {
+    tasks: Mutex<Slab<TaskState>>,
+    ready_sender: channel::Sender<(TaskBox, usize)>,
+}
+
+impl ExecutorInner {
+    fn spawn<T>(&self, task: T) -> usize where T: Future<Output = ()> + Send + 'static {
+        let pinned = Box::pin(task);
+        let key = self.tasks.lock().unwrap().insert(TaskState::Executing);
+        self.ready_sender.send((pinned, key)).unwrap();
+        key
+    }
+
+    fn wakeup(&self, task_key: usize) {
+        let mut tasks = self.tasks.lock().unwrap();
+        let task_state = tasks.get_mut(task_key).expect("tried to wakeup unknown task!");
+        if let TaskState::Waiting(task) = std::mem::replace(task_state, TaskState::ScheduledAgain) {
+            *task_state = TaskState::Executing;
+            drop(tasks);
+            self.ready_sender.send((task, task_key)).unwrap();
+        }
+    }
 }
 
 thread_local! {
-    static RUNTIME: RefCell<Option<RuntimeInnerHandle>> = RefCell::default();
+    static CURRENT_EXECUTOR: RefCell<Option<Weak<ExecutorInner>>> = RefCell::new(None);
 }
 
-fn current_runtime() -> RuntimeInnerHandle {
-    RUNTIME.with(|r| {
-        r.borrow().as_ref().expect("no current runtime!").clone()
-    })
+struct Executor {
+    inner: Option<Arc<ExecutorInner>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
 }
 
-struct RunGuard<'a> {
-    _runtime: &'a Runtime,
-}
+impl Executor {
+    fn new(nthreads: usize, reactor: Option<Arc<Reactor>>) -> Executor {
+        let (ready_sender, ready_receiver) = channel::unbounded::<(TaskBox, usize)>();
+        let inner = Arc::new(
+            ExecutorInner {
+                tasks: Mutex::new(Slab::new()),
+                ready_sender,
+            });
 
-impl<'a> RunGuard<'a> {
-    fn new(runtime: &Runtime) -> RunGuard {
-        RUNTIME.with(|r| {
-            *r.borrow_mut() = Some(runtime.inner.clone());
+        let mut workers = Vec::new();
+        for _ in 0..nthreads {
+            let inner = Arc::clone(&inner);
+            let ready_receiver = ready_receiver.clone();
+            let reactor = reactor.clone();
+
+            let worker = move || {
+                let _executor_guard = Executor::set_current(&inner);
+                // downgrading to Weak so that Executor::drop can drop inner.ready_sender
+                // and thus signal the thread to stop.
+                let inner = Arc::downgrade(&inner);
+
+                let _reactor_guard;
+                if let Some(reactor) = reactor {
+                    _reactor_guard = Reactor::set_current(&reactor);
+                }
+
+                while let Ok((mut ready_task, key)) = ready_receiver.recv() {
+                    let waker = new_waker(key);
+                    let mut ctx = task::Context::from_waker(&waker);
+                    match ready_task.as_mut().poll(&mut ctx) {
+                        task::Poll::Ready(()) => {
+                            eprintln!("task {} done", key);
+                            if let Some(inner) = Weak::upgrade(&inner) {
+                                inner.tasks.lock().unwrap().remove(key);
+                            } else {
+                                return;
+                            }
+                        }
+
+                        task::Poll::Pending => {
+                            if let Some(inner) = Weak::upgrade(&inner) {
+                                let mut tasks = inner.tasks.lock().unwrap();
+                                let task_state = tasks.get_mut(key)
+                                    .expect("got key for nonexistent task from ready queue");
+                                match task_state {
+                                    TaskState::Executing => {
+                                        *task_state = TaskState::Waiting(ready_task);
+                                    }
+
+                                    TaskState::ScheduledAgain => {
+                                        *task_state = TaskState::Executing;
+                                        drop(tasks);
+                                        inner.ready_sender.send((ready_task, key)).unwrap();
+                                    }
+
+                                    TaskState::Waiting(_) => panic!("two different tasks with the same key!"),
+                                }
+                            } else {
+                                return;
+                            }
+                        }
+                    }
+                }
+            };
+
+            workers.push(std::thread::spawn(worker));
+        };
+
+        Executor {
+            inner: Some(inner),
+            workers,
+        }
+    }
+
+    fn set_current(inner: &Arc<ExecutorInner>) -> ScopeGuard<impl FnOnce() -> ()> {
+        CURRENT_EXECUTOR.with(|e| {
+            *e.borrow_mut() = Some(Arc::downgrade(inner));
         });
 
-        RunGuard { _runtime: runtime }
+        ScopeGuard {
+            on_exit: Some(|| {
+                CURRENT_EXECUTOR.with(|e| {
+                    e.replace(None);
+                });
+            }),
+        }
+    }
+
+    fn current() -> Option<Arc<ExecutorInner>> {
+        CURRENT_EXECUTOR.with(|e| {
+            Weak::upgrade(e.borrow().as_ref().expect("no current executor!"))
+        })
     }
 }
 
-impl<'a> Drop for RunGuard<'a> {
+impl Drop for Executor {
     fn drop(&mut self) {
-        RUNTIME.with(|r| {
-            *r.borrow_mut() = None;
-        });
+        self.inner = None;
+        for worker in self.workers.drain(..) {
+            worker.join().unwrap();
+        }
+        eprintln!("executor stopped!");
     }
 }
 
@@ -75,11 +181,8 @@ static WAKER_VTABLE: task::RawWakerVTable = {
     unsafe fn wake_fn(task_idx: *const ()) {
         // consumes the Box
         let task_idx: usize = std::mem::transmute(task_idx);
-        let runtime_handle = current_runtime();
-        let mut runtime = runtime_handle.borrow_mut();
-        let task = runtime.tasks.get_mut(task_idx).expect("can't wake nonexistent task");
-        if let Some(task) = task.take() {
-            runtime.ready_queue.push_back((task, task_idx))
+        if let Some(executor) = Executor::current() {
+            executor.wakeup(task_idx);
         }
     }
 
@@ -100,86 +203,94 @@ fn new_waker(task_idx: usize) -> task::Waker {
 }
 
 pub fn spawn<T>(task: T)
-where T: Future<Output = ()> + 'static {
-    current_runtime().borrow_mut().spawn(task);
+where T: Future<Output = ()> + Send + 'static {
+    if let Some(executor) = Executor::current() {
+        executor.spawn(task);
+    }
+}
+
+struct Reactor {
+    poll: mio::Poll,
+     // it is expected that only one task owns the resource so at max one task is waiting for the wakeup.
+    io_resources: Mutex<Slab<Option<task::Waker>>>,
+}
+
+thread_local! {
+    static CURRENT_REACTOR: RefCell<Option<Weak<Reactor>>> = RefCell::new(None);
+}
+
+impl Reactor {
+    fn set_current(reactor: &Arc<Reactor>) -> ScopeGuard<impl FnOnce() -> ()> {
+        CURRENT_REACTOR.with(|r| {
+            *r.borrow_mut() = Some(Arc::downgrade(reactor));
+        });
+
+        ScopeGuard {
+            on_exit: Some(|| {
+                CURRENT_REACTOR.with(|r| {
+                    r.replace(None);
+                });
+            }),
+        }
+    }
+
+    fn current() -> Option<Arc<Reactor>> {
+        CURRENT_REACTOR.with(|e| {
+            Weak::upgrade(e.borrow().as_ref().expect("no current reactor!"))
+        })
+    }
+}
+
+pub struct Runtime {
+    reactor: Arc<Reactor>,
+    executor: Executor,
 }
 
 impl Runtime {
-    pub fn new() -> io::Result<Runtime> {
-        let inner = RuntimeInner {
+    pub fn new(nthreads: usize) -> io::Result<Runtime> {
+        let reactor = Arc::new(Reactor {
             poll: mio::Poll::new()?,
-            io_resources: Slab::new(),
-            tasks: Slab::new(),
-            ready_queue: VecDeque::new(),
-        };
+            io_resources: Mutex::default(),
+        });
 
-        Ok(Runtime { inner: Arc::new(RefCell::new(inner)), })
+        let executor = Executor::new(nthreads, Some(Arc::clone(&reactor)));
+
+        Ok(Runtime { reactor, executor })
     }
 
     pub fn run<T>(&mut self, task: T) -> io::Result<()>
-    where T: Future<Output = ()> + 'static {
-        let _run_guard = RunGuard::new(self);
+    where T: Future<Output = ()> + Send + 'static {
+        let executor = self.executor.inner.as_ref().unwrap();
+        executor.spawn(task);
 
-        let runtime = &self.inner;
-        runtime.borrow_mut().spawn(task);
-
+        // XXX adapt reactor so that the loop can be exited
+        let _executor_guard = Executor::set_current(executor);
         let mut events = mio::Events::with_capacity(1024);
+        // while !runtime.executor.is_empty() {
+        loop {
+            self.reactor.poll.poll(&mut events, None)?;
 
-        while !runtime.borrow().tasks.is_empty() {
-            if runtime.borrow().ready_queue.is_empty() {
-                runtime.borrow().poll.poll(&mut events, None)?;
-
-                for event in &events {
-                    let mut wakers = vec![];
-                    std::mem::swap(
-                        runtime.borrow_mut().io_resources.get_mut(event.token().0)
-                            .expect("got token for nonexistent io resource"),
-                        &mut wakers);
-                    for waker in wakers.into_iter() {
-                        waker.wake();
-                    }
-                }
-            }
-
-            loop {
-                // Work around https://github.com/rust-lang/rust/issues/38355
-                let res = runtime.borrow_mut().ready_queue.pop_front();
-                match res {
-                    Some((mut ready_task, key)) => {
-                        let waker = new_waker(key);
-                        let mut ctx = task::Context::from_waker(&waker);
-                        match ready_task.as_mut().poll(&mut ctx) {
-                            task::Poll::Ready(()) => {
-                                eprintln!("task {} done", key);
-                                runtime.borrow_mut().tasks.remove(key);
-                            }
-
-                            task::Poll::Pending => {
-                                runtime.borrow_mut().tasks.get_mut(key)
-                                    .expect("got key for nonexistent task from ready queue")
-                                    .replace(ready_task);
-                            }
-                        }
-                    }
-
-                    None => break,
+            for event in &events {
+                let mut to_wake = self.reactor.io_resources.lock().unwrap().get_mut(event.token().0)
+                    .expect("got token for nonexistent io resource")
+                    .take();
+                if let Some(waker) = to_wake.take() {
+                    waker.wake();
                 }
             }
         }
-
-        Ok(())
     }
 }
 
 struct Registration {
-    runtime: Weak<RefCell<RuntimeInner>>, // storing Weak to runtime to avoid cycles during cancellation.
+    reactor: Weak<Reactor>, // storing Weak to runtime to avoid cycles during cancellation.
     key: usize,
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        if let Some(runtime) = Weak::upgrade(&self.runtime) {
-            runtime.borrow_mut().io_resources.remove(self.key);
+        if let Some(reactor) = Weak::upgrade(&self.reactor) {
+            reactor.io_resources.lock().unwrap().remove(self.key);
         }
     }
 }
@@ -192,16 +303,16 @@ struct IoResource<T: mio::Evented> {
 impl<T: mio::Evented> IoResource<T> {
     fn register(&mut self, interest: mio::Ready, waker: task::Waker) -> io::Result<()> {
         match self.registration {
-            Some(Registration { ref runtime, key }) => {
-                match Weak::upgrade(runtime) {
-                    Some(runtime) => {
-                        let (mut io_resources, poll) = RefMut::map_split(
-                            runtime.borrow_mut(),
-                            |r| (&mut r.io_resources, &mut r.poll));
-                        poll.reregister(
+            Some(Registration { ref reactor, key }) => {
+                match Weak::upgrade(reactor) {
+                    Some(reactor) => {
+                        let mut io_resources = reactor.io_resources.lock().unwrap();
+                        reactor.poll.reregister(
                             &self.inner, mio::Token(key), interest, mio::PollOpt::edge() | mio::PollOpt::oneshot())?;
-                        io_resources.get_mut(key).expect("unknown io resource")
-                            .push(waker);
+                        let to_wake = io_resources.get_mut(key).expect("unknown io resource");
+                        if let Some(_another_waker) = to_wake.replace(waker) {
+                            panic!("io resource was registered with another task!");
+                        }
                     }
 
                     None => return Err(
@@ -214,15 +325,15 @@ impl<T: mio::Evented> IoResource<T> {
                 // register the waker with poll.
                 // waker is associated with toplevel future
                 // , so we must save the association io_resource -> waker somewhere.
-                let runtime = current_runtime();
-                let (mut io_resources, poll) = RefMut::map_split(
-                    runtime.borrow_mut(),
-                    |r| (&mut r.io_resources, &mut r.poll));
-                let entry = io_resources.vacant_entry();
-                let key = entry.key();
-                poll.register(&self.inner, mio::Token(key), interest, mio::PollOpt::edge() | mio::PollOpt::oneshot())?;
-                entry.insert(vec![waker]);
-                self.registration = Some(Registration { runtime: Arc::downgrade(&runtime), key });
+                if let Some(reactor) = Reactor::current() {
+                    let mut io_resources = reactor.io_resources.lock().unwrap();
+                    let entry = io_resources.vacant_entry();
+                    let key = entry.key();
+                    reactor.poll.register(
+                        &self.inner, mio::Token(key), interest, mio::PollOpt::edge() | mio::PollOpt::oneshot())?;
+                    entry.insert(Some(waker));
+                    self.registration = Some(Registration { reactor: Arc::downgrade(&reactor), key });
+                }
             }
         }
 
