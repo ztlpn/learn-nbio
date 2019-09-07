@@ -1,5 +1,5 @@
 use std::{
-    sync::{Arc, Weak, Mutex},
+    sync::{Arc, Weak, Mutex, Condvar},
     cell::RefCell,
     pin::Pin,
     future::Future,
@@ -37,6 +37,7 @@ enum TaskState {
 
 struct ExecutorInner {
     tasks: Mutex<Slab<TaskState>>,
+    done_cond: Condvar,
     ready_sender: channel::Sender<(TaskBox, usize)>,
 }
 
@@ -57,6 +58,13 @@ impl ExecutorInner {
             self.ready_sender.send((task, task_id)).unwrap();
         }
     }
+
+    fn block_until_done(&self) {
+        let mut tasks = self.tasks.lock().unwrap();
+        while !tasks.is_empty() {
+            tasks = self.done_cond.wait(tasks).unwrap();
+        }
+    }
 }
 
 thread_local! {
@@ -69,25 +77,27 @@ struct Executor {
 }
 
 impl Executor {
-    fn new(nthreads: usize, reactor: Option<Arc<Reactor>>) -> Executor {
+    fn new(nthreads: usize, reactor: Option<Arc<ReactorInner>>) -> Executor {
         let (ready_sender, ready_receiver) = channel::unbounded::<(TaskBox, usize)>();
         let inner = Arc::new(
             ExecutorInner {
                 tasks: Mutex::new(Slab::new()),
+                done_cond: Condvar::new(),
                 ready_sender,
             });
 
         let mut workers = Vec::new();
         for _ in 0..nthreads {
-            let inner = Arc::clone(&inner);
+            let inner_strong = Arc::clone(&inner);
             let ready_receiver = ready_receiver.clone();
             let reactor = reactor.clone();
 
             let worker = move || {
-                let _executor_guard = Executor::set_current(&inner);
+                let _executor_guard = Executor::set_current(&inner_strong);
                 // downgrading to Weak so that Executor::drop can drop inner.ready_sender
                 // and thus signal the thread to stop.
-                let inner = Arc::downgrade(&inner);
+                let inner = Arc::downgrade(&inner_strong);
+                drop(inner_strong);
 
                 let _reactor_guard;
                 if let Some(reactor) = reactor {
@@ -101,7 +111,11 @@ impl Executor {
                         task::Poll::Ready(()) => {
                             eprintln!("task {} done", task_id);
                             if let Some(inner) = Weak::upgrade(&inner) {
-                                inner.tasks.lock().unwrap().remove(task_id);
+                                let mut tasks = inner.tasks.lock().unwrap();
+                                tasks.remove(task_id);
+                                if tasks.is_empty() {
+                                    inner.done_cond.notify_all();
+                                }
                             } else {
                                 return;
                             }
@@ -165,6 +179,8 @@ impl Executor {
 
 impl Drop for Executor {
     fn drop(&mut self) {
+        // Note: it is a very unreliable way to stop workers. Some strong ref to inner can end up stored somewhere
+        // resulting in a deadlock.
         self.inner = None;
         for worker in self.workers.drain(..) {
             worker.join().unwrap();
@@ -233,20 +249,96 @@ where T: Future<Output = ()> + Send + 'static {
     }
 }
 
-struct Reactor {
-    poll: mio::Poll,
+struct ReactorState {
      // it is expected that only one task owns the resource so at max one task is waiting for the wakeup.
-    io_resources: Mutex<Slab<Option<task::Waker>>>,
+    io_resources: Slab<Option<task::Waker>>,
+    is_stopped: bool,
+}
+
+struct ReactorInner {
+    poll: mio::Poll,
+    state: Mutex<ReactorState>,
+    _stop_registration: mio::Registration,
+    stop_readiness: mio::SetReadiness,
+}
+
+impl ReactorInner {
+    fn set_stopped(&self) {
+        let mut state = self.state.lock().unwrap();
+
+        state.is_stopped = true;
+        for maybe_waker in state.io_resources.drain() {
+            if let Some(waker) = maybe_waker {
+                waker.wake();
+            }
+        }
+    }
+}
+
+struct Reactor {
+    inner: Arc<ReactorInner>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 thread_local! {
-    static CURRENT_REACTOR: RefCell<Option<Weak<Reactor>>> = RefCell::new(None);
+    static CURRENT_REACTOR: RefCell<Option<Arc<ReactorInner>>> = RefCell::new(None);
 }
 
 impl Reactor {
-    fn set_current(reactor: &Arc<Reactor>) -> ScopeGuard<impl FnOnce() -> ()> {
+    fn new() -> io::Result<Reactor> {
+        let poll = mio::Poll::new()?;
+        let mut io_resources = Slab::new();
+        let (stop_registration, stop_readiness) = mio::Registration::new2();
+        let stop_key = io_resources.insert(None); // not strictly necessary but easier when tokens are equal to slab keys
+        poll.register(&stop_registration, mio::Token(stop_key), mio::Ready::readable(), mio::PollOpt::edge())?;
+
+        let inner = Arc::new(ReactorInner {
+            poll,
+            state: Mutex::new(ReactorState {
+                io_resources,
+                is_stopped: false,
+            }),
+            _stop_registration: stop_registration,
+            stop_readiness,
+        });
+
+        let thread = std::thread::spawn({
+            let inner = inner.clone();
+            move || {
+                let mut events = mio::Events::with_capacity(1024);
+                loop {
+                    if let Err(e) = inner.poll.poll(&mut events, None) {
+                        eprintln!("reactor error while polling: {}", e);
+                        inner.set_stopped();
+                        return;
+                    }
+
+                    let mut state = inner.state.lock().unwrap();
+                    if state.is_stopped {
+                        return;
+                    }
+
+                    for event in &events {
+                        let mut to_wake = state.io_resources.get_mut(event.token().0)
+                            .expect("got token for nonexistent io resource")
+                            .take();
+                        if let Some(waker) = to_wake.take() {
+                            waker.wake();
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Reactor {
+            inner,
+            thread: Some(thread),
+        })
+    }
+
+    fn set_current(reactor: &Arc<ReactorInner>) -> ScopeGuard<impl FnOnce() -> ()> {
         CURRENT_REACTOR.with(|r| {
-            *r.borrow_mut() = Some(Arc::downgrade(reactor));
+            *r.borrow_mut() = Some(reactor.clone());
         });
 
         ScopeGuard {
@@ -258,62 +350,59 @@ impl Reactor {
         }
     }
 
-    fn current() -> Option<Arc<Reactor>> {
+    fn current() -> Arc<ReactorInner> {
         CURRENT_REACTOR.with(|e| {
-            Weak::upgrade(e.borrow().as_ref().expect("no current reactor!"))
+            e.borrow().as_ref().expect("no current reactor!").clone()
         })
     }
 }
 
+impl Drop for Reactor {
+    fn drop(&mut self) {
+        self.inner.set_stopped();
+        self.inner.stop_readiness.set_readiness(mio::Ready::readable()).unwrap();
+
+        if let Err(e) = self.thread.take().unwrap().join() {
+            eprintln!("reactor error: {:?}", e);
+        }
+        eprintln!("reactor stopped!");
+    }
+}
+
 pub struct Runtime {
-    reactor: Arc<Reactor>,
+    _reactor: Reactor,
     executor: Executor,
 }
 
 impl Runtime {
     pub fn new(nthreads: usize) -> io::Result<Runtime> {
-        let reactor = Arc::new(Reactor {
-            poll: mio::Poll::new()?,
-            io_resources: Mutex::default(),
-        });
+        let reactor = Reactor::new()?;
+        let executor = Executor::new(nthreads, Some(Arc::clone(&reactor.inner)));
 
-        let executor = Executor::new(nthreads, Some(Arc::clone(&reactor)));
-
-        Ok(Runtime { reactor, executor })
+        Ok(Runtime {
+            _reactor: reactor,
+            executor,
+        })
     }
 
-    pub fn run<T>(&mut self, task: T) -> io::Result<()>
+    pub fn run<T>(&mut self, task: T)
     where T: Future<Output = ()> + Send + 'static {
         let executor = self.executor.inner.as_ref().unwrap();
         executor.spawn(task);
-
-        // XXX adapt reactor so that the loop can be exited
-        let mut events = mio::Events::with_capacity(1024);
-        loop {
-        // while !runtime.executor.is_empty() {
-            self.reactor.poll.poll(&mut events, None)?;
-
-            for event in &events {
-                let mut to_wake = self.reactor.io_resources.lock().unwrap().get_mut(event.token().0)
-                    .expect("got token for nonexistent io resource")
-                    .take();
-                if let Some(waker) = to_wake.take() {
-                    waker.wake();
-                }
-            }
-        }
+        executor.block_until_done();
     }
 }
 
 struct Registration {
-    reactor: Weak<Reactor>, // storing Weak to runtime to avoid cycles during cancellation.
+    reactor: Arc<ReactorInner>,
     key: usize,
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        if let Some(reactor) = Weak::upgrade(&self.reactor) {
-            reactor.io_resources.lock().unwrap().remove(self.key);
+        let mut reactor_state = self.reactor.state.lock().unwrap();
+        if !reactor_state.is_stopped {
+            reactor_state.io_resources.remove(self.key);
         }
     }
 }
@@ -325,22 +414,20 @@ struct IoResource<T: mio::Evented> {
 
 impl<T: mio::Evented> IoResource<T> {
     fn register(&mut self, interest: mio::Ready, waker: task::Waker) -> io::Result<()> {
-        match self.registration {
-            Some(Registration { ref reactor, key }) => {
-                match Weak::upgrade(reactor) {
-                    Some(reactor) => {
-                        let mut io_resources = reactor.io_resources.lock().unwrap();
-                        reactor.poll.reregister(
-                            &self.inner, mio::Token(key), interest, mio::PollOpt::edge() | mio::PollOpt::oneshot())?;
-                        let to_wake = io_resources.get_mut(key).expect("unknown io resource");
-                        if let Some(_another_waker) = to_wake.replace(waker) {
-                            panic!("io resource was registered with another task!");
-                        }
-                    }
-
-                    None => return Err(
+        match &self.registration {
+            Some(Registration { reactor, key }) => {
+                let mut reactor_state = reactor.state.lock().unwrap();
+                if reactor_state.is_stopped {
+                    return Err(
                         io::Error::new(
-                            io::ErrorKind::Other, "runtime already dropped")),
+                            io::ErrorKind::Other, "reactor already stopped"))
+                }
+
+                reactor.poll.reregister(
+                    &self.inner, mio::Token(*key), interest, mio::PollOpt::edge() | mio::PollOpt::oneshot())?;
+                let to_wake = reactor_state.io_resources.get_mut(*key).expect("unknown io resource");
+                if let Some(_another_waker) = to_wake.replace(waker) {
+                    panic!("io resource was registered with another task!");
                 }
             }
 
@@ -348,15 +435,20 @@ impl<T: mio::Evented> IoResource<T> {
                 // register the waker with poll.
                 // waker is associated with toplevel future
                 // , so we must save the association io_resource -> waker somewhere.
-                if let Some(reactor) = Reactor::current() {
-                    let mut io_resources = reactor.io_resources.lock().unwrap();
-                    let entry = io_resources.vacant_entry();
-                    let key = entry.key();
-                    reactor.poll.register(
-                        &self.inner, mio::Token(key), interest, mio::PollOpt::edge() | mio::PollOpt::oneshot())?;
-                    entry.insert(Some(waker));
-                    self.registration = Some(Registration { reactor: Arc::downgrade(&reactor), key });
+                let reactor = Reactor::current();
+                let mut reactor_state = reactor.state.lock().unwrap();
+                if reactor_state.is_stopped {
+                    return Err(
+                        io::Error::new(
+                            io::ErrorKind::Other, "reactor already stopped"))
                 }
+
+                let entry = reactor_state.io_resources.vacant_entry();
+                let key = entry.key();
+                reactor.poll.register(
+                    &self.inner, mio::Token(key), interest, mio::PollOpt::edge() | mio::PollOpt::oneshot())?;
+                entry.insert(Some(waker));
+                self.registration = Some(Registration { reactor: reactor.clone(), key });
             }
         }
 

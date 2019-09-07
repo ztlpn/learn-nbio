@@ -62,5 +62,7 @@ fn main() -> io::Result<()> {
         if let Err(e) = res {
             eprintln!("error while listening: {}", e);
         }
-    })
+    });
+
+    Ok(())
 }
