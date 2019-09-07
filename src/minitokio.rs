@@ -48,13 +48,13 @@ impl ExecutorInner {
         key
     }
 
-    fn wakeup(&self, task_key: usize) {
+    fn wakeup(&self, task_id: usize) {
         let mut tasks = self.tasks.lock().unwrap();
-        let task_state = tasks.get_mut(task_key).expect("tried to wakeup unknown task!");
+        let task_state = tasks.get_mut(task_id).expect("tried to wakeup unknown task!");
         if let TaskState::Waiting(task) = std::mem::replace(task_state, TaskState::ScheduledAgain) {
             *task_state = TaskState::Executing;
             drop(tasks);
-            self.ready_sender.send((task, task_key)).unwrap();
+            self.ready_sender.send((task, task_id)).unwrap();
         }
     }
 }
@@ -94,14 +94,14 @@ impl Executor {
                     _reactor_guard = Reactor::set_current(&reactor);
                 }
 
-                while let Ok((mut ready_task, key)) = ready_receiver.recv() {
-                    let waker = new_waker(key);
+                while let Ok((mut ready_task, task_id)) = ready_receiver.recv() {
+                    let waker = Executor::get_waker(inner.clone(), task_id);
                     let mut ctx = task::Context::from_waker(&waker);
                     match ready_task.as_mut().poll(&mut ctx) {
                         task::Poll::Ready(()) => {
-                            eprintln!("task {} done", key);
+                            eprintln!("task {} done", task_id);
                             if let Some(inner) = Weak::upgrade(&inner) {
-                                inner.tasks.lock().unwrap().remove(key);
+                                inner.tasks.lock().unwrap().remove(task_id);
                             } else {
                                 return;
                             }
@@ -110,8 +110,8 @@ impl Executor {
                         task::Poll::Pending => {
                             if let Some(inner) = Weak::upgrade(&inner) {
                                 let mut tasks = inner.tasks.lock().unwrap();
-                                let task_state = tasks.get_mut(key)
-                                    .expect("got key for nonexistent task from ready queue");
+                                let task_state = tasks.get_mut(task_id)
+                                    .expect("got id for nonexistent task from ready queue");
                                 match task_state {
                                     TaskState::Executing => {
                                         *task_state = TaskState::Waiting(ready_task);
@@ -120,10 +120,10 @@ impl Executor {
                                     TaskState::ScheduledAgain => {
                                         *task_state = TaskState::Executing;
                                         drop(tasks);
-                                        inner.ready_sender.send((ready_task, key)).unwrap();
+                                        inner.ready_sender.send((ready_task, task_id)).unwrap();
                                     }
 
-                                    TaskState::Waiting(_) => panic!("two different tasks with the same key!"),
+                                    TaskState::Waiting(_) => panic!("two different tasks with the same task_id!"),
                                 }
                             } else {
                                 return;
@@ -173,32 +173,56 @@ impl Drop for Executor {
     }
 }
 
-static WAKER_VTABLE: task::RawWakerVTable = {
-    unsafe fn clone_fn(task_idx: *const ()) -> task::RawWaker {
-        task::RawWaker::new(task_idx, &WAKER_VTABLE)
-    }
+struct Waker {
+    executor: Weak<ExecutorInner>,
+    task_id: usize,
+}
 
-    unsafe fn wake_fn(task_idx: *const ()) {
-        // consumes the Box
-        let task_idx: usize = std::mem::transmute(task_idx);
-        if let Some(executor) = Executor::current() {
-            executor.wakeup(task_idx);
+impl Waker {
+    fn wake(&self) {
+        if let Some(executor) = Weak::upgrade(&self.executor) {
+            executor.wakeup(self.task_id);
         }
     }
+}
 
-    unsafe fn wake_by_ref_fn(task_idx: *const ()) {
-        wake_fn(task_idx);
+static WAKER_VTABLE: task::RawWakerVTable = {
+    unsafe fn clone_fn(waker: *const ()) -> task::RawWaker {
+        let this_waker: Arc<Waker> = Arc::from_raw(std::mem::transmute(waker));
+        let new_waker = this_waker.clone();
+        std::mem::forget(this_waker); // will be dropped in drop_fn
+        task::RawWaker::new(std::mem::transmute(Arc::into_raw(new_waker)), &WAKER_VTABLE)
     }
 
-    unsafe fn drop_fn(_task_idx: *const ()) {
+    unsafe fn wake_fn(waker: *const ()) {
+        // consumes the Arc
+        let waker: Arc<Waker> = Arc::from_raw(std::mem::transmute(waker));
+        waker.wake();
+    }
+
+    unsafe fn wake_by_ref_fn(waker: *const ()) {
+        let waker: *const Waker = std::mem::transmute(waker);
+        waker.as_ref().unwrap().wake();
+    }
+
+    unsafe fn drop_fn(waker: *const ()) {
+        let waker: Arc<Waker> = Arc::from_raw(std::mem::transmute(waker));
+        drop(waker);
     }
 
     task::RawWakerVTable::new(clone_fn, wake_fn, wake_by_ref_fn, drop_fn)
 };
 
-fn new_waker(task_idx: usize) -> task::Waker {
-    unsafe {
-        task::Waker::from_raw(task::RawWaker::new(std::mem::transmute(task_idx), &WAKER_VTABLE))
+impl Executor {
+    fn get_waker(executor: Weak<ExecutorInner>, task_id: usize) -> task::Waker {
+        let waker = Arc::new(Waker {
+            executor,
+            task_id,
+        });
+
+        unsafe {
+            task::Waker::from_raw(task::RawWaker::new(std::mem::transmute(Arc::into_raw(waker)), &WAKER_VTABLE))
+        }
     }
 }
 
@@ -264,10 +288,9 @@ impl Runtime {
         executor.spawn(task);
 
         // XXX adapt reactor so that the loop can be exited
-        let _executor_guard = Executor::set_current(executor);
         let mut events = mio::Events::with_capacity(1024);
-        // while !runtime.executor.is_empty() {
         loop {
+        // while !runtime.executor.is_empty() {
             self.reactor.poll.poll(&mut events, None)?;
 
             for event in &events {
