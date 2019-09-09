@@ -13,6 +13,7 @@ use crossbeam::{
     channel,
 };
 
+/// A helper to run something on exiting the scope.
 struct ScopeGuard<T: FnOnce() -> ()> {
     on_exit: Option<T>
 }
@@ -24,24 +25,27 @@ impl<T: FnOnce() -> ()> Drop for ScopeGuard<T> {
     }
 }
 
-// a task is a toplevel future that is driven by the executor.
+/// A task is a toplevel future that is driven by the executor.
 type TaskBox = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-// current state of the task in the executor
+/// Represents current state of the task in the executor.
 enum TaskState {
     Waiting(TaskBox),
     Executing,
-     // the task is currently executing and has signalled that it is ready to be executed again immediately.
+    /// the task is currently executing and has signalled that it is ready to be executed again immediately.
     ScheduledAgain,
 }
 
 struct ExecutorInner {
+    // A task is moved between the tasks slab (where it is stored in the TaskState::Waiting state),
+    // the queue and the threads that execute it.
     tasks: Mutex<Slab<TaskState>>,
     done_cond: Condvar,
     ready_sender: channel::Sender<(TaskBox, usize)>,
 }
 
 impl ExecutorInner {
+    /// Create a new toplevel task and immediately schedule it for execution.
     fn spawn<T>(&self, task: T) -> usize where T: Future<Output = ()> + Send + 'static {
         let pinned = Box::pin(task);
         let key = self.tasks.lock().unwrap().insert(TaskState::Executing);
@@ -49,16 +53,18 @@ impl ExecutorInner {
         key
     }
 
+    /// Schedule a known task for execution. If it is currently executing, it will be scheduled again
+    /// immediately upon completion.
     fn wakeup(&self, task_id: usize) {
         let mut tasks = self.tasks.lock().unwrap();
         let task_state = tasks.get_mut(task_id).expect("tried to wakeup unknown task!");
         if let TaskState::Waiting(task) = std::mem::replace(task_state, TaskState::ScheduledAgain) {
             *task_state = TaskState::Executing;
-            drop(tasks);
             self.ready_sender.send((task, task_id)).unwrap();
         }
     }
 
+    /// Wait until there is no more tasks in this executor.
     fn block_until_done(&self) {
         let mut tasks = self.tasks.lock().unwrap();
         while !tasks.is_empty() {
@@ -77,6 +83,8 @@ struct Executor {
 }
 
 impl Executor {
+    /// Create an executor with `nthreads` threads. If `reactor` is not none, the CURRENT_REACTOR thread-local
+    /// variable will be set to its value.
     fn new(nthreads: usize, reactor: Option<Arc<ReactorInner>>) -> Executor {
         let (ready_sender, ready_receiver) = channel::unbounded::<(TaskBox, usize)>();
         let inner = Arc::new(
@@ -104,6 +112,8 @@ impl Executor {
                     _reactor_guard = Reactor::set_current(&reactor);
                 }
 
+                // If recv returns Err it means that the ExecutorInner and thus the sender sender was dropped
+                // and we must stop the thread.
                 while let Ok((mut ready_task, task_id)) = ready_receiver.recv() {
                     let waker = Executor::get_waker(inner.clone(), task_id);
                     let mut ctx = task::Context::from_waker(&waker);
@@ -156,6 +166,7 @@ impl Executor {
         }
     }
 
+    /// Set current executor for this worker thread.
     fn set_current(inner: &Arc<ExecutorInner>) -> ScopeGuard<impl FnOnce() -> ()> {
         CURRENT_EXECUTOR.with(|e| {
             *e.borrow_mut() = Some(Arc::downgrade(inner));
@@ -170,6 +181,7 @@ impl Executor {
         }
     }
 
+    /// Get current executor for this worker thread.
     fn current() -> Option<Arc<ExecutorInner>> {
         CURRENT_EXECUTOR.with(|e| {
             Weak::upgrade(e.borrow().as_ref().expect("no current executor!"))
@@ -189,6 +201,13 @@ impl Drop for Executor {
     }
 }
 
+/// We need to implement our own waker and to hook it up with std::Future via the std::task::Waker object.
+/// The standard library provides a fairly involved way to do this: we provide a table of 4 "virtual functions"
+/// that each receive an opaque pointer to our waker.
+///
+/// In our implementation a waker is an Arc<Waker> that contains a task_id and a pointer to the executor
+/// and the opaque pointer is actually the pointer that we get from Arc::to_raw.
+/// Some care is needed to maintain the refcount of an Arc correctly.
 struct Waker {
     executor: Weak<ExecutorInner>,
     task_id: usize,
@@ -206,12 +225,15 @@ static WAKER_VTABLE: task::RawWakerVTable = {
     unsafe fn clone_fn(waker: *const ()) -> task::RawWaker {
         let this_waker: Arc<Waker> = Arc::from_raw(std::mem::transmute(waker));
         let new_waker = this_waker.clone();
-        std::mem::forget(this_waker); // will be dropped in drop_fn
+        // This is a bit tricky. Arc::to_raw creates an additional reference that will consume a refcount if dropped.
+        // But logically the waker is still owned by the original object and will be dropped in drop_fn.
+        // So we forget `this_walker` so that the refcount doesn't get too low.
+        std::mem::forget(this_waker);
         task::RawWaker::new(std::mem::transmute(Arc::into_raw(new_waker)), &WAKER_VTABLE)
     }
 
     unsafe fn wake_fn(waker: *const ()) {
-        // consumes the Arc
+        // consumes the Arc represented by `waker`
         let waker: Arc<Waker> = Arc::from_raw(std::mem::transmute(waker));
         waker.wake();
     }
@@ -230,6 +252,7 @@ static WAKER_VTABLE: task::RawWakerVTable = {
 };
 
 impl Executor {
+    /// Create a waker for the given `task_id` that we can then stick into the Future::poll.
     fn get_waker(executor: Weak<ExecutorInner>, task_id: usize) -> task::Waker {
         let waker = Arc::new(Waker {
             executor,
@@ -242,6 +265,9 @@ impl Executor {
     }
 }
 
+/// Spawn a toplevel task with the current executor.
+/// Expects the current thread-local executor to be set and thus panics
+/// if called outside a task currently executed by an Executor.
 pub fn spawn<T>(task: T)
 where T: Future<Output = ()> + Send + 'static {
     if let Some(executor) = Executor::current() {
@@ -250,7 +276,9 @@ where T: Future<Output = ()> + Send + 'static {
 }
 
 struct ReactorState {
-     // it is expected that only one task owns the resource so at max one task is waiting for the wakeup.
+    // It is expected that only one task owns the resource so at max one task is waiting for the wakeup.
+    // This is in contrast with tokio where one task can wait for read availability and some other task
+    // for write availability.
     io_resources: Slab<Option<task::Waker>>,
     is_stopped: bool,
 }
@@ -258,11 +286,20 @@ struct ReactorState {
 struct ReactorInner {
     poll: mio::Poll,
     state: Mutex<ReactorState>,
+
+    // This stuff is needed to wakeup and stop the reactor thread if all tasks are finished and we want to
+    // drop the runtime. We need to save the `_stop_registration` object or the registration will be
+    // deregistered from poll.
+    //
+    // Note that the `stop_readiness` and the `state.is_stopped` flag are similar (both signal the need to stop)
+    // so in theoru we could just use `stop_readiness` and check it for read readiness everywhere instead of
+    // checking `is_stopped` but the flag contains no internal surprises so I decided to add it anyway.
     _stop_registration: mio::Registration,
     stop_readiness: mio::SetReadiness,
 }
 
 impl ReactorInner {
+    /// Set the `is_stopped` flag and wake all tasks so that the finish ASAP (they will check the flag and exit).
     fn set_stopped(&self) {
         let mut state = self.state.lock().unwrap();
 
@@ -277,6 +314,9 @@ impl ReactorInner {
 
 struct Reactor {
     inner: Arc<ReactorInner>,
+    // The thread where we will wait for OS events for the IO resources that interest us. This is a separate thread
+    // so that we can signal it and stop waiting at any time
+    // (e.g. when there are no tasks left or when there is an error).
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -289,7 +329,9 @@ impl Reactor {
         let poll = mio::Poll::new()?;
         let mut io_resources = Slab::new();
         let (stop_registration, stop_readiness) = mio::Registration::new2();
-        let stop_key = io_resources.insert(None); // not strictly necessary but easier when tokens are equal to slab keys
+        // Reserving a key for the stop token not strictly necessary but it is easier when
+        // IO resource tokens are equal to the slab keys.
+        let stop_key = io_resources.insert(None);
         poll.register(&stop_registration, mio::Token(stop_key), mio::Ready::readable(), mio::PollOpt::edge())?;
 
         let inner = Arc::new(ReactorInner {
@@ -336,6 +378,7 @@ impl Reactor {
         })
     }
 
+    /// Set the current reactor in this thread.
     fn set_current(reactor: &Arc<ReactorInner>) -> ScopeGuard<impl FnOnce() -> ()> {
         CURRENT_REACTOR.with(|r| {
             *r.borrow_mut() = Some(reactor.clone());
@@ -350,6 +393,7 @@ impl Reactor {
         }
     }
 
+    /// Get the current reactor in this thread.
     fn current() -> Arc<ReactorInner> {
         CURRENT_REACTOR.with(|e| {
             e.borrow().as_ref().expect("no current reactor!").clone()
@@ -369,12 +413,16 @@ impl Drop for Reactor {
     }
 }
 
+/// A runtime that can execute futures. Contains a multithreaded Executor to poll tasks (toplevel futures)
+/// and a Reactor to wait for IO resources.
 pub struct Runtime {
     _reactor: Reactor,
     executor: Executor,
 }
 
 impl Runtime {
+    /// Creates a new Runtime
+    /// for the IO resources and wakeup corresponding tasks.
     pub fn new(nthreads: usize) -> io::Result<Runtime> {
         let reactor = Reactor::new()?;
         let executor = Executor::new(nthreads, Some(Arc::clone(&reactor.inner)));
@@ -385,6 +433,7 @@ impl Runtime {
         })
     }
 
+    /// Run the task (represented by a Future) to completion.
     pub fn run<T>(&mut self, task: T)
     where T: Future<Output = ()> + Send + 'static {
         let executor = self.executor.inner.as_ref().unwrap();
@@ -393,6 +442,7 @@ impl Runtime {
     }
 }
 
+/// A helper that is owned by an IO resource and represents its registration with the Reactor.
 struct Registration {
     reactor: Arc<ReactorInner>,
     key: usize,
@@ -423,6 +473,13 @@ impl<T: mio::Evented> IoResource<T> {
                             io::ErrorKind::Other, "reactor already stopped"))
                 }
 
+                // We are using PollOpt::oneshot here to ensure that an IO resource is either waiting for
+                // an OS event in the reactor or is used by a task that is currently executing.
+                // With oneshot strategy when we get an event the resource is automatically deregistered
+                // and we can be sure that no other events will come (until we reregister the resource)
+                // Probably, because in our case the resource is associated with strictly one task, nothing bad
+                // will happen, but we can get spurios notifications for the data that we have already read.
+                // See also: https://idea.popcount.org/2017-02-20-epoll-is-fundamentally-broken-12/
                 reactor.poll.reregister(
                     &self.inner, mio::Token(*key), interest, mio::PollOpt::edge() | mio::PollOpt::oneshot())?;
                 let to_wake = reactor_state.io_resources.get_mut(*key).expect("unknown io resource");
@@ -432,9 +489,7 @@ impl<T: mio::Evented> IoResource<T> {
             }
 
             None => {
-                // register the waker with poll.
-                // waker is associated with toplevel future
-                // , so we must save the association io_resource -> waker somewhere.
+                // Register the IO resource with poll and add the waker for the current toplevel task to the Reactor.
                 let reactor = Reactor::current();
                 let mut reactor_state = reactor.state.lock().unwrap();
                 if reactor_state.is_stopped {
@@ -456,11 +511,13 @@ impl<T: mio::Evented> IoResource<T> {
     }
 }
 
+/// Represents a TCP connection.
 pub struct TcpStream {
     resource: IoResource<mio::net::TcpStream>,
 }
 
 impl TcpStream {
+    /// Create a TcpStream and start connecting to `addr`.
     pub fn connect(addr: &std::net::SocketAddr) -> io::Result<TcpStream> {
         Ok(TcpStream {
             resource: IoResource {
@@ -471,10 +528,12 @@ impl TcpStream {
     }
 
 
+    /// Asynchronously read from the stream.
     pub fn read<'a, 'b>(&'a mut self, buf: &'b mut [u8]) -> ReadFuture<'a, 'b> {
         ReadFuture { stream: self, buf }
     }
 
+    /// Asynchronously write to the stream.
     pub fn write<'a, 'b>(&'a mut self, buf: &'b [u8]) -> WriteFuture<'a, 'b> {
         WriteFuture { stream: self, buf }
     }
@@ -530,11 +589,13 @@ impl Future for WriteFuture<'_, '_> {
     }
 }
 
+/// Represents a TCP listening socket.
 pub struct TcpListener {
     resource: IoResource<mio::net::TcpListener>,
 }
 
 impl TcpListener {
+    // Create a TcpListener and bind it to `addr`.
     pub fn bind(addr: &std::net::SocketAddr) -> io::Result<TcpListener> {
         Ok(TcpListener {
             resource: IoResource {
@@ -544,7 +605,7 @@ impl TcpListener {
         })
     }
 
-
+    /// Asynchronously accept a connection from the listening socket.
     pub fn accept(&mut self) -> AcceptFuture {
         AcceptFuture { listener: self }
     }
