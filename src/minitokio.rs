@@ -474,10 +474,15 @@ impl<T: mio::Evented> IoResource<T> {
             Some(Registration { reactor, key }) => {
                 let mut reactor_state = reactor.state.lock().unwrap();
                 if reactor_state.is_stopped {
-                    return Err(
-                        io::Error::new(
-                            io::ErrorKind::Other, "reactor already stopped"))
+                    return Err(io::Error::new(io::ErrorKind::Other, "reactor already stopped"));
                 }
+
+                let to_wake = reactor_state.io_resources.get_mut(*key).expect("unknown io resource");
+                if let Some(_another_waker) = to_wake.replace(waker) {
+                    panic!("io resource was registered with another task!");
+                }
+
+                drop(reactor_state);
 
                 // We are using PollOpt::oneshot here to ensure that an IO resource is either waiting for
                 // an OS event in the reactor or is used by a task that is currently executing.
@@ -488,10 +493,6 @@ impl<T: mio::Evented> IoResource<T> {
                 // See also: https://idea.popcount.org/2017-02-20-epoll-is-fundamentally-broken-12/
                 reactor.poll.reregister(
                     &self.inner, mio::Token(*key), interest, mio::PollOpt::edge() | mio::PollOpt::oneshot())?;
-                let to_wake = reactor_state.io_resources.get_mut(*key).expect("unknown io resource");
-                if let Some(_another_waker) = to_wake.replace(waker) {
-                    panic!("io resource was registered with another task!");
-                }
             }
 
             None => {
@@ -499,17 +500,16 @@ impl<T: mio::Evented> IoResource<T> {
                 let reactor = Reactor::current();
                 let mut reactor_state = reactor.state.lock().unwrap();
                 if reactor_state.is_stopped {
-                    return Err(
-                        io::Error::new(
-                            io::ErrorKind::Other, "reactor already stopped"))
+                    return Err(io::Error::new(io::ErrorKind::Other, "reactor already stopped"))
                 }
 
-                let entry = reactor_state.io_resources.vacant_entry();
-                let key = entry.key();
+                let key = reactor_state.io_resources.insert(Some(waker));
+                self.registration = Some(Registration { reactor: reactor.clone(), key });
+
+                drop(reactor_state);
+
                 reactor.poll.register(
                     &self.inner, mio::Token(key), interest, mio::PollOpt::edge() | mio::PollOpt::oneshot())?;
-                entry.insert(Some(waker));
-                self.registration = Some(Registration { reactor: reactor.clone(), key });
             }
         }
 
