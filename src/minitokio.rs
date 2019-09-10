@@ -26,11 +26,15 @@ impl<T: FnOnce() -> ()> Drop for ScopeGuard<T> {
 }
 
 /// A task is a toplevel future that is driven by the executor.
-type TaskBox = Pin<Box<dyn Future<Output = ()> + Send>>;
+struct Task {
+    future: Pin<Box<dyn Future<Output = ()> + Send>>,
+    id: usize,
+    waker: task::Waker,
+}
 
 /// Represents current state of the task in the executor.
 enum TaskState {
-    Waiting(TaskBox),
+    Waiting(Task),
     Executing,
     /// the task is currently executing and has signalled that it is ready to be executed again immediately.
     ScheduledAgain,
@@ -41,16 +45,19 @@ struct ExecutorInner {
     // the queue and the threads that execute it.
     tasks: Mutex<Slab<TaskState>>,
     done_cond: Condvar,
-    ready_sender: channel::Sender<(TaskBox, usize)>,
+    ready_sender: channel::Sender<Task>,
 }
 
 impl ExecutorInner {
     /// Create a new toplevel task and immediately schedule it for execution.
-    fn spawn<T>(&self, task: T) -> usize where T: Future<Output = ()> + Send + 'static {
-        let pinned = Box::pin(task);
-        let key = self.tasks.lock().unwrap().insert(TaskState::Executing);
-        self.ready_sender.send((pinned, key)).unwrap();
-        key
+    fn spawn<T>(this: &Arc<Self>, task: T) where T: Future<Output = ()> + Send + 'static {
+        let id = this.tasks.lock().unwrap().insert(TaskState::Executing);
+        let task = Task {
+            future: Box::pin(task),
+            id,
+            waker: Self::get_waker(this, id),
+        };
+        this.ready_sender.send(task).unwrap();
     }
 
     /// Schedule a known task for execution. If it is currently executing, it will be scheduled again
@@ -60,7 +67,7 @@ impl ExecutorInner {
         let task_state = tasks.get_mut(task_id).expect("tried to wakeup unknown task!");
         if let TaskState::Waiting(task) = std::mem::replace(task_state, TaskState::ScheduledAgain) {
             *task_state = TaskState::Executing;
-            self.ready_sender.send((task, task_id)).unwrap();
+            self.ready_sender.send(task).unwrap();
         }
     }
 
@@ -86,7 +93,7 @@ impl Executor {
     /// Create an executor with `nthreads` threads. If `reactor` is not none, the CURRENT_REACTOR thread-local
     /// variable will be set to its value.
     fn new(nthreads: usize, reactor: Option<Arc<ReactorInner>>) -> Executor {
-        let (ready_sender, ready_receiver) = channel::unbounded::<(TaskBox, usize)>();
+        let (ready_sender, ready_receiver) = channel::unbounded::<Task>();
         let inner = Arc::new(
             ExecutorInner {
                 tasks: Mutex::new(Slab::new()),
@@ -114,15 +121,14 @@ impl Executor {
 
                 // If recv returns Err it means that the ExecutorInner and thus the sender sender was dropped
                 // and we must stop the thread.
-                while let Ok((mut ready_task, task_id)) = ready_receiver.recv() {
-                    let waker = Executor::get_waker(inner.clone(), task_id);
-                    let mut ctx = task::Context::from_waker(&waker);
-                    match ready_task.as_mut().poll(&mut ctx) {
+                while let Ok(mut ready_task) = ready_receiver.recv() {
+                    let mut ctx = task::Context::from_waker(&ready_task.waker);
+                    match ready_task.future.as_mut().poll(&mut ctx) {
                         task::Poll::Ready(()) => {
-                            eprintln!("task {} done", task_id);
+                            eprintln!("task {} done", ready_task.id);
                             if let Some(inner) = Weak::upgrade(&inner) {
                                 let mut tasks = inner.tasks.lock().unwrap();
-                                tasks.remove(task_id);
+                                tasks.remove(ready_task.id);
                                 if tasks.is_empty() {
                                     inner.done_cond.notify_all();
                                 }
@@ -134,7 +140,7 @@ impl Executor {
                         task::Poll::Pending => {
                             if let Some(inner) = Weak::upgrade(&inner) {
                                 let mut tasks = inner.tasks.lock().unwrap();
-                                let task_state = tasks.get_mut(task_id)
+                                let task_state = tasks.get_mut(ready_task.id)
                                     .expect("got id for nonexistent task from ready queue");
                                 match task_state {
                                     TaskState::Executing => {
@@ -144,7 +150,7 @@ impl Executor {
                                     TaskState::ScheduledAgain => {
                                         *task_state = TaskState::Executing;
                                         drop(tasks);
-                                        inner.ready_sender.send((ready_task, task_id)).unwrap();
+                                        inner.ready_sender.send(ready_task).unwrap();
                                     }
 
                                     TaskState::Waiting(_) => panic!("two different tasks with the same task_id!"),
@@ -251,11 +257,11 @@ static WAKER_VTABLE: task::RawWakerVTable = {
     task::RawWakerVTable::new(clone_fn, wake_fn, wake_by_ref_fn, drop_fn)
 };
 
-impl Executor {
+impl ExecutorInner {
     /// Create a waker for the given `task_id` that we can then stick into the Future::poll.
-    fn get_waker(executor: Weak<ExecutorInner>, task_id: usize) -> task::Waker {
+    fn get_waker(this: &Arc<Self>, task_id: usize) -> task::Waker {
         let waker = Arc::new(Waker {
-            executor,
+            executor: Arc::downgrade(this),
             task_id,
         });
 
@@ -271,7 +277,7 @@ impl Executor {
 pub fn spawn<T>(task: T)
 where T: Future<Output = ()> + Send + 'static {
     if let Some(executor) = Executor::current() {
-        executor.spawn(task);
+        ExecutorInner::spawn(&executor, task);
     }
 }
 
@@ -437,7 +443,7 @@ impl Runtime {
     pub fn run<T>(&mut self, task: T)
     where T: Future<Output = ()> + Send + 'static {
         let executor = self.executor.inner.as_ref().unwrap();
-        executor.spawn(task);
+        ExecutorInner::spawn(executor, task);
         executor.block_until_done();
     }
 }
