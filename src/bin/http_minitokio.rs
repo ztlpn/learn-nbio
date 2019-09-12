@@ -3,14 +3,14 @@
 use {
     std::io::self,
 
-    nbio::{
-        minitokio::{
-            self,
-            Runtime,
-            TcpListener,
-            TcpStream,
-        },
+    minitokio::{
+        self,
+        Runtime,
+        TcpListener,
+        TcpStream,
+    },
 
+    nbio::{
         RequestBuf,
         process_request,
     }
